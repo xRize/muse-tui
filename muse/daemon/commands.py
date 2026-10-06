@@ -6,6 +6,7 @@ The daemon exposes these over a Unix-domain JSON-RPC socket.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from muse import db as dbmod
@@ -32,6 +33,7 @@ class MuseCommands:
         self.daemon = daemon
         self.engine: audio.Engine | None = None
         self.database: dbmod.Database | None = None
+        self.daemon_stop_signal: threading.Event | None = None
 
     # -- wiring ---------------------------------------------------------------
     def db(self) -> dbmod.Database:
@@ -60,6 +62,7 @@ class MuseCommands:
             eng.set_voice(voice)
             eng.resume()
             db.record_play(track_id, 0)
+            self._media_now_playing(t)
             return {"playing": t["title"], "duration": t.get("duration")}
         if not query:
             if eng.is_playing():
@@ -70,7 +73,8 @@ class MuseCommands:
             return {"error": f"no local match for {query!r} (try `muse search`)"}
         return self.cmd_play(track_id=results[0]["id"])
 
-    def _make_voice(self, db: dbmod.Database, t: dict, tempo_scale: float = 1.0) -> audio.Voice:
+    def _make_voice(self, db: dbmod.Database, t: dict,
+                    tempo_scale: float = 1.0, seek: float = 0.0) -> audio.Voice:
         ainfo = db.get_analysis(t["id"]) or {}
         lufs = ainfo.get("loudness")
         # ReplayGain-style: target -16 LUFS (typical stream loudness), cap ±9dB
@@ -82,7 +86,10 @@ class MuseCommands:
         duration = t.get("duration") or ainfo.get("duration") or 0
         if not duration:
             duration = self._probe_duration(path)
-        return audio.Voice(t["id"], path, duration, gain=gain, tempo=tempo_scale)
+        voice = audio.Voice(t["id"], path, duration, gain=gain,
+                            tempo=tempo_scale, seek=seek)
+        voice.tempo = tempo_scale  # keeps working if seek rebuilds the decoder
+        return voice
 
     def _probe_duration(self, path: str) -> float:
         try:
@@ -116,36 +123,105 @@ class MuseCommands:
         return {"state": "stopped"}
 
     def cmd_next(self, smart: bool | None = None) -> dict:
-        """Play next: engine crossfade handoff, or Smart Shuffle when queue empty."""
+        """Play next: live crossfade when AutoMix is on, else hard switch;
+        Smart Shuffle pick when the queue is empty."""
         db = self.db()
         eng = self.audio_engine()
         smart = db.get_setting_bool("shuffle_smart", True) if smart is None else smart
         nxt_id = db.pop_queue_head()
-        if nxt_id:
-            result = self.cmd_play(track_id=nxt_id)
-            return result
-        if smart:
+        if not nxt_id and smart:
             current_id = eng.current.track_id if eng.current else None
             pick = shuffle_mod.smart_shuffle_next(db, current_id)
             if pick:
-                result = self.cmd_play(track_id=pick["id"])
-                result["smart_shuffle"] = True
-                result["score"] = pick.get("transition_score")
-                return result
-        return {"state": "queue empty"}
+                nxt_id = pick["id"]
+        if not nxt_id:
+            return {"state": "queue empty"}
+        if eng.current and not eng.current.done and \
+                db.get_setting_bool("automix_enabled", True):
+            plan = self._plan_to_track(eng.current.track_id, nxt_id)
+            overlap = db.get_setting_float("automix_transition_length", 8.0)
+            if plan and plan.get("score", 0) >= 45:
+                out = self._live_crossfade(nxt_id, plan["overlap_sec"],
+                                           tempo=plan["tempo_scale"],
+                                           band=db.get_setting_bool("automix_bandpass", True),
+                                           seek=plan.get("b_start_sec") or 0.0)
+                out["plan_score"] = plan.get("score")
+                return out
+            remaining = (eng.current.duration or 0) - eng.position()
+            if remaining > 1.0:
+                out = self._live_crossfade(nxt_id, min(overlap, remaining))
+                return out
+        return self.cmd_play(track_id=nxt_id)
+
+    def _live_crossfade(self, nxt_id: int, fade_seconds: float, tempo: float = 1.0,
+                        band: bool = False, seek: float = 0.0) -> dict:
+        db = self.db()
+        nxt = db.get_track(nxt_id)
+        if not nxt:
+            return {"error": f"no track {nxt_id}"}
+        voice = self._make_voice(db, nxt, tempo_scale=tempo, seek=seek)
+        eng = self.audio_engine()
+        eng.begin_crossfade(voice, fade_seconds, band_limited=band)
+        eng.resume()
+        db.record_play(nxt_id, 0)
+        self._media_now_playing(nxt)
+        return {"playing": nxt["title"], "duration": nxt.get("duration"),
+                "crossfade": round(float(fade_seconds), 2)}
 
     def cmd_prev(self) -> dict:
-        # prototype: history tail
-        hist = self.db().stats()
-        return {"state": "no previous track (history-based prev is a later milestone)",
-                "history_entries": hist["history"]}
+        """Real previous: restart the current track; before 3s, return to the
+        last distinct play (history-based, spec §4)."""
+        eng = self.audio_engine()
+        db = self.db()
+        pos = eng.position() if eng.current else 0.0
+        if eng.current and pos < 3.0:
+            eng.stop()
+            tid = db.pop_last_played(exclude_id=eng.current.track_id)
+            if tid is None:
+                return {"state": "no previous track"}
+            t = db.get_track(tid)
+            if not t:
+                return {"state": "no previous track"}
+            return self.cmd_play(track_id=tid)
+        eng.seek(0.0)
+        return {"state": "restarted", "position": 0.0}
+
+    def cmd_seek(self, seconds: float, relative: bool = False) -> dict:
+        """Seek the current track (spec §4); `relative` adds to the position."""
+        eng = self.audio_engine()
+        if eng.current is None:
+            return {"error": "nothing playing"}
+        try:
+            s = float(seconds)
+        except (TypeError, ValueError):
+            return {"error": f"bad seek value: {seconds}"}
+        target = eng.position() + s if relative else s
+        pos = eng.seek(target)
+        return {"position": round(pos, 1), "duration": eng.current.duration}
+
+    def cmd_history(self, limit: int = 20) -> dict:
+        return {"history": [self._track_view(t, self.db())
+                            for t in self.db().history_tracks(limit=limit)]}
+
+    def cmd_stats(self) -> dict:
+        db = self.db()
+        top = db.conn.execute(
+            "SELECT t.id, t.title, a.name AS artist, t.play_count "
+            "FROM tracks t LEFT JOIN artists a ON a.id = t.artist_id "
+            "ORDER BY t.play_count DESC, t.id LIMIT 10").fetchall()
+        return {"library": db.stats(),
+                "top": [dict(r) for r in top]}
 
     # -- queue / library --------------------------------------------------------
-    def cmd_queue(self, action: str = "list", ref: str | None = None) -> dict:
+    def cmd_queue(self, action: str = "list", ref: str | None = None,
+                  keep_first: bool = False) -> dict:
         db = self.db()
         if action == "clear":
             db.clear_queue()
             return {"queue": [], "cleared": True}
+        if action == "shuffle":
+            n = db.shuffle_queue(keep_first=keep_first)
+            return {"queue": self._queue_view(db), "shuffled": n}
         if action in ("add", "remove") and ref:
             if action == "add":
                 rows = self._resolve_tracks(db, ref)
@@ -185,8 +261,13 @@ class MuseCommands:
         return {"query": query, "results": rows}
 
     def cmd_library(self, artist: str | None = None, album: str | None = None,
-                    offset: int = 0, limit: int = 100) -> dict:
-        rows = self.db().list_tracks(limit=limit, artist=artist, album=album)
+                    offset: int = 0, limit: int = 100, kind: str | None = None) -> dict:
+        db = self.db()
+        if kind == "artists":
+            return {"artists": db.list_artists()}
+        if kind == "albums":
+            return {"albums": db.list_albums(artist=artist)}
+        rows = db.list_tracks(limit=limit, artist=artist, album=album)
         rows = rows[offset:]
         return {"tracks": rows}
 
@@ -228,6 +309,19 @@ class MuseCommands:
                     db.delete_playlist(pl["id"])
                     return {"deleted": name}
             return {"error": f"playlist not found: {name}"}
+        if action == "play" and name:
+            for pl in db.list_playlists():
+                if pl["name"] == name:
+                    rows = db.playlist_tracks(pl["id"])
+                    if not rows:
+                        return {"error": f"playlist empty: {name}"}
+                    db.clear_queue()
+                    db.add_to_queue([r["id"] for r in rows[1:]])
+                    result = self.cmd_play(track_id=rows[0]["id"])
+                    result["playlist"] = name
+                    result["queued"] = len(rows) - 1
+                    return result
+            return {"error": f"playlist not found: {name}"}
         if action == "add" and name and ref:
             for pl in db.list_playlists():
                 if pl["name"] == name:
@@ -245,6 +339,38 @@ class MuseCommands:
                     return {"playlist": name, "tracks": [self._track_view(r, db) for r in rows]}
             return {"error": f"playlist not found: {name}"}
         return {"playlists": db.list_playlists()}
+
+    # -- discover (smart-playlist recs) ------------------------------------------
+    def cmd_discover(self, seed: str | None = None, length: int = 12,
+                     enqueue: bool = False, variety: float = 0.5) -> dict:
+        """Spec §4 `discover`: recommendation shuffle across the library.
+        Like radio, but biased for exploration (no seed required, no enqueues
+        by default, wider randomization among good matches via top-k)."""
+        db = self.db()
+        eng = self.engine
+        seed_id = None
+        if seed:
+            rows = self._resolve_tracks(db, seed)
+            if not rows:
+                return {"error": f"no match for {seed!r}"}
+            seed_id = rows[0]["id"]
+        elif eng and eng.current:
+            seed_id = eng.current.track_id
+        top_k = max(3, min(15, round(10 * variety)))
+        picked: list[dict] = []
+        exclude: set[int] = set()
+        cur = seed_id
+        for _ in range(length):
+            pick = shuffle_mod.smart_shuffle_next(db, cur, exclude_ids=exclude,
+                                                  top_k=top_k)
+            if not pick:
+                break
+            picked.append(pick)
+            exclude.add(pick["id"])
+            cur = pick["id"]
+        if enqueue and picked:
+            db.add_to_queue([t["id"] for t in picked])
+        return {"discover": [self._track_view(t, db) for t in picked]}
 
     def cmd_like(self, ref: str | None = None, like: bool = True) -> dict:
         db = self.db()
@@ -314,19 +440,37 @@ class MuseCommands:
     # -- automix ---------------------------------------------------------------------
     def cmd_automix(self, action: str = "config", value: str | None = None) -> dict:
         db = self.db()
+        onoff = (str(value).lower() in ("1", "on", "true", "yes")
+                 if value is not None else None)
         if action in ("on", "off"):
             db.set_setting("automix_enabled", "1" if action == "on" else "0")
-        if action == "length" and value:
+        elif action == "length" and value:
             try:
                 db.set_setting("automix_transition_length", str(max(2.0, min(16.0, float(value)))))
             except ValueError:
                 return {"error": f"bad length: {value}"}
+        elif action in ("bandpass", "band"):
+            if onoff is None:
+                return {"error": "usage: automix bandpass on|off"}
+            db.set_setting("automix_bandpass", "1" if onoff else "0")
+        elif action == "vocal":
+            if onoff is None:
+                return {"error": "usage: automix vocal on|off"}
+            db.set_setting("automix_vocal_mode", "1" if onoff else "0")
         return {
             "enabled": db.get_setting_bool("automix_enabled", True),
             "transition_length": db.get_setting_float("automix_transition_length", 8.0),
-            "beat_match": True,
-            "harmonic_match": True,
+            "beat_match": db.get_setting_bool("automix_beat_match", True),
+            "harmonic_match": db.get_setting_bool("automix_harmonic_match", True),
+            "bandpass": db.get_setting_bool("automix_bandpass", True),
+            "vocal_mode": db.get_setting_bool("automix_vocal_mode", False),
         }
+
+    def cmd_daemon_stop(self) -> dict:
+        """Stop playback and signal the daemon process to exit (spec: `stop`)."""
+        ev = self.daemon_stop_signal or _exit_event()
+        ev.set()
+        return {"state": "stopped", "daemon_exiting": bool(ev.is_set())}
 
     def cmd_automix_preview(self, ref_a: str, ref_b: str) -> dict:
         """Dry-run two-track transition plan without playing (spec §3)."""
@@ -341,7 +485,11 @@ class MuseCommands:
         aa = dict(aa or {}); aa["duration"] = aa.get("duration") or a.get("duration")
         bb = dict(bb or {}); bb["duration"] = bb.get("duration") or b.get("duration")
         length = db.get_setting_float("automix_transition_length", 8.0)
-        plan = automix_mod.plan_transition(aa, bb, transition_length=length)
+        plan = automix_mod.plan_transition(
+            aa, bb, transition_length=length,
+            beat_match=db.get_setting_bool("automix_beat_match", True),
+            harmonic_match=db.get_setting_bool("automix_harmonic_match", True),
+            vocal_mode=db.get_setting_bool("automix_vocal_mode", False))
         text = automix_mod.format_plan(a["title"], b["title"], plan)
         return {"plan": plan, "text": text,
                 "track_a": self._track_view(a, db), "track_b": self._track_view(b, db)}
@@ -459,6 +607,143 @@ class MuseCommands:
         except Exception:
             return 0.0
 
+    # -- daemon tick: auto-advance + live AutoMix ---------------------------------
+    def service_tick(self) -> dict | None:
+        """Called ~every 0.5s by the daemon's main loop (and safe for tests).
+
+        Responsibilities (spec §1 'gapless', §3 AutoMix):
+        - when the current voice has finished with no crossfade, advance to the
+          queue head (or Smart Shuffle) — no dead air;
+        - when the remaining time reaches the transition length and AutoMix is
+          on, schedule the crossfade with the planned tempo scale / anchors.
+        Returns a small dict describing what happened (for tests/logs), else None.
+        """
+        eng = self.engine
+        if eng is None or self.database is None or eng.paused:
+            return None
+        if eng.needs_advance():
+            return self._advance_after_end()
+        cur = eng.current
+        if not cur or cur.done or not self.db().get_setting_bool("automix_enabled", True):
+            return None
+        duration = cur.duration or 0
+        if duration <= 0:
+            return None
+        remaining = duration - cur.position_seconds
+        overlap = self.db().get_setting_float("automix_transition_length", 8.0)
+        if remaining > overlap + 0.05 or remaining <= 0:
+            return None
+        if getattr(eng, "upcoming", None):  # already fading
+            return None
+        nxt_id = self.db().peek_queue_head()
+        if not nxt_id:
+            return None
+        plan = self._plan_to_track(cur.track_id, nxt_id)
+        if not plan:
+            return None
+        if plan.get("score", 0) < 45:
+            return None
+        # honor the planned beat anchor: wait until A reaches a_end_sec, then
+        # fade for (duration - a_end). The earlier "remaining <= overlap" gate
+        # only arms the planner once we're inside the transition zone.
+        a_end = plan.get("a_end_sec")
+        if a_end is None:
+            a_end = duration
+        if cur.position_seconds < a_end - 0.05:
+            return None
+        nxt_id = self.db().pop_queue_head()
+        nxt = self.db().get_track(nxt_id)
+        if not nxt or not nxt.get("file_path"):
+            # leave a missing/broken entry for the plain-advance path to skip;
+            # the automix handoff just won't happen this tick
+            return None
+        voice = self._make_voice(self.db(), nxt, tempo_scale=plan["tempo_scale"],
+                                 seek=plan.get("b_start_sec") if
+                                 plan.get("b_start_sec") is not None else 0.0)
+        band = self.db().get_setting_bool("automix_bandpass", True)
+        eng.begin_crossfade(voice, plan["overlap_sec"], band_limited=band)
+        self.db().record_play(nxt_id, 0)
+        self._media_now_playing(nxt)
+        log.info("automix: track %s -> %s (score %s, overlap %ss)",
+                 cur.track_id, nxt_id, plan.get("score"), plan.get("overlap_sec"))
+        return {"automix": True, "from": cur.track_id, "to": nxt_id,
+                "overlap": plan["overlap_sec"], "score": plan.get("score")}
+
+    def _plan_to_track(self, from_id: int, to_id: int) -> dict | None:
+        try:
+            aa = analysis_worker.ensure_analysis(self.db(), from_id)
+            bb = analysis_worker.ensure_analysis(self.db(), to_id)
+            if not aa or not bb:
+                return None
+            db = self.db()
+            cur_t = db.get_track(from_id) or {}
+            nxt_t = db.get_track(to_id) or {}
+            aa = dict(aa); bb = dict(bb)
+            aa["duration"] = aa.get("duration") or cur_t.get("duration")
+            bb["duration"] = bb.get("duration") or nxt_t.get("duration")
+            length = db.get_setting_float("automix_transition_length", 8.0)
+            return automix_mod.plan_transition(
+                aa, bb, transition_length=length,
+                beat_match=db.get_setting_bool("automix_beat_match", True),
+                harmonic_match=db.get_setting_bool("automix_harmonic_match", True),
+                vocal_mode=db.get_setting_bool("automix_vocal_mode", False))
+        except Exception:
+            log.exception("automix planning failed")
+            return None
+
+    def _advance_after_end(self) -> dict | None:
+        """Track ended with no crossfade: pop the queue (or Smart Shuffle)."""
+        eng, db = self.engine, self.db()
+
+        def start(tid: int, smart: bool = False) -> dict | None:
+            t = db.get_track(tid)
+            if not t or not t.get("file_path"):
+                return None
+            path = t["file_path"].replace("~", str(Path.home()))
+            if not Path(path).is_file():
+                return None
+            duration = t.get("duration") or 0
+            if not duration:
+                duration = self._probe_duration(path)
+            db.record_play(tid, 0)
+            eng.set_voice_at(tid, path, duration, self._gain_for(t))
+            self._media_now_playing(t)
+            return {"advanced_to": tid, "smart": smart}
+
+        while True:
+            nxt_id = db.pop_queue_head()
+            if not nxt_id:
+                break
+            advanced = start(nxt_id)
+            if advanced:
+                return advanced
+            log.info("auto-advance: skipping broken queue entry %s", nxt_id)
+        if db.get_setting_bool("shuffle_smart", True):
+            current_id = eng.current.track_id if eng.current else None
+            pick = shuffle_mod.smart_shuffle_next(db, current_id)
+            if pick:
+                return start(pick["id"], smart=True)
+        return None
+
+    def _gain_for(self, t: dict) -> float:
+        db = self.db()
+        ainfo = db.get_analysis(t["id"]) or {}
+        lufs = ainfo.get("loudness")
+        if lufs and lufs > -60:
+            delta_db = min(9.0, max(-9.0, -16.0 - lufs))
+            return 10 ** (delta_db / 20)
+        return 1.0
+
+    def _media_now_playing(self, t: dict) -> None:
+        md = getattr(self.daemon, "media", None) if self.daemon else None
+        if md:
+            try:
+                md.update_now_playing(t.get("title") or "", t.get("artist") or "",
+                                      t.get("album") or "",
+                                      float(t.get("duration") or 0.0), 0.0, True)
+            except Exception:
+                pass
+
     def _track_view(self, t: dict, db: dbmod.Database) -> dict:
         a = db.get_analysis(t["id"]) or {}
         return {
@@ -467,18 +752,35 @@ class MuseCommands:
             "provider": t.get("provider"), "liked": t.get("liked", 0),
             "position": t.get("position"),
             "bpm": a.get("bpm"), "key": a.get("key"),
+            "vocal_end": a.get("vocal_end_sec"), "vocal_intro": a.get("vocal_intro_sec"),
         }
 
 
 # -- command dispatch, used by CLI directly and by daemon over IPC ----------------
 
 _SHARED: MuseCommands | None = None
+_EXIT_REQUESTED: threading.Event | None = None
+
+
+def exit_requested() -> bool:
+    """True after a `daemon_stop` command (daemon main loop polls this)."""
+    return _EXIT_REQUESTED is not None and _EXIT_REQUESTED.is_set()
+
+
+def _exit_event() -> threading.Event:
+    """Module-level stop event, created on first use (also by direct-mode
+    registries that never went through enable_shared_registry)."""
+    global _EXIT_REQUESTED
+    if _EXIT_REQUESTED is None:
+        _EXIT_REQUESTED = threading.Event()
+    return _EXIT_REQUESTED
 
 
 def enable_shared_registry() -> MuseCommands:
     """Daemon calls this once: all IPC requests then share engine + DB state."""
     global _SHARED
     _SHARED = MuseCommands()
+    _SHARED.daemon_stop_signal = _exit_event()
     return _SHARED
 
 

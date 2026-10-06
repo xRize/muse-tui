@@ -66,18 +66,29 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--plain", action="store_true", help="skip Smart Shuffle")
     sp = mk("prev")
     sp = mk("status")
+    sp = mk("stats", help="library/play counts summary")
 
-    sp = mk("queue", help="list/add/remove/clear queue")
+    sp = mk("seek", help="seek [+-]seconds (absolute or relative)")
+    sp.add_argument("seconds")
+
+    sp = mk("queue", help="list/add/remove/shuffle/clear queue")
     sp.add_argument("action", nargs="?", default="list")
     sp.add_argument("ref", nargs="?")
+    sp.add_argument("--keep-first", action="store_true",
+                    help="shuffle: keep the playing track first")
+
+    sp = mk("shuffle", help="shuffle the queue (alias of `queue shuffle`)")
+    sp.add_argument("--keep-first", action="store_true",
+                    help="keep the playing track first")
 
     sp = mk("search", help="search providers (local by default)")
     sp.add_argument("query")
     sp.add_argument("--provider", default="local", choices=["local", "youtube", "all"])
 
-    sp = mk("library", help="list library")
+    sp = mk("library", help="list tracks (--kind artists|albums for groups)")
     sp.add_argument("--artist")
     sp.add_argument("--album")
+    sp.add_argument("--kind", choices=["artists", "albums"], default=None)
 
     sp = mk("import", help="add audio file/directory to library")
     sp.add_argument("path")
@@ -112,6 +123,16 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--length", type=int, default=12)
     sp.add_argument("--no-enqueue", action="store_true")
 
+    sp = mk("discover", help="exploration shuffle across the library (spec §4)")
+    sp.add_argument("seed", nargs="?")
+    sp.add_argument("--length", type=int, default=12)
+    sp.add_argument("--enqueue", action="store_true")
+    sp.add_argument("--variety", type=float, default=0.5,
+                    help="0..1, higher = wider picks")
+
+    sp = mk("history", help="recently played")
+    sp.add_argument("--limit", type=int, default=20)
+
     sp = mk("get", help="download from YouTube via yt-dlp")
     sp.add_argument("url")
 
@@ -120,11 +141,16 @@ def main(argv: list[str] | None = None) -> int:
     sp = mk("cover")
     sp.add_argument("ref", nargs="?")
 
-    sp = mk("daemon", help="start/stop the background daemon")
-    sp.add_argument("action", nargs="?", default="start")
+    sp = mk("daemon", help="start/stop/status/restart the background daemon")
+    sp.add_argument("action", nargs="?", default="start",
+                    choices=["start", "stop", "status", "restart"])
 
     mk("tui", help="launch the interactive TUI")
     mk("legal", help="YouTube/Apple download+DRM notices")
+
+    sp = mk("completions", help="print shell-completion script (bash/zsh/fish)")
+    sp.add_argument("shell", nargs="?", default="bash",
+                    choices=["bash", "zsh", "fish"])
 
     args = p.parse_args(argv)
 
@@ -146,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if c == "daemon":
         return _daemon(args.action, js)
+    if c == "completions":
+        return _print_completions(args.shell)
 
     # map CLI -> ipc method/args
     if c == "play":
@@ -157,11 +185,16 @@ def main(argv: list[str] | None = None) -> int:
     elif c == "next":
         resp = _call("next", {"smart": not args.plain}, js)
     elif c == "queue":
-        resp = _call("queue", {"action": args.action, "ref": args.ref}, js)
+        resp = _call("queue", {"action": args.action, "ref": args.ref,
+                               "keep_first": getattr(args, "keep_first", False)}, js)
+    elif c == "shuffle":
+        resp = _call("queue", {"action": "shuffle",
+                               "keep_first": getattr(args, "keep_first", False)}, js)
     elif c == "search":
         resp = _call("search", {"query": args.query, "provider": args.provider}, js)
     elif c == "library":
-        resp = _call("library", {"artist": args.artist, "album": args.album}, js)
+        resp = _call("library", {"artist": args.artist, "album": args.album,
+                                 "kind": getattr(args, "kind", None)}, js)
     elif c == "import":
         resp = _call("import", {"path": args.path}, js)
     elif c == "analyze":
@@ -174,6 +207,21 @@ def main(argv: list[str] | None = None) -> int:
         resp = _call("like", {"ref": args.ref, "like": c == "like"}, js)
     elif c == "volume":
         resp = _call("volume", {"value": args.value}, js)
+    elif c == "seek":
+        try:
+            resp = _call("seek", {"seconds": float(args.seconds),
+                                  "relative": args.seconds.startswith(("+", "-"))}, js)
+        except ValueError:
+            print(f"error: bad seek value: {args.seconds}", file=sys.stderr)
+            return 2
+    elif c == "stats":
+        resp = _call("stats", {}, js)
+    elif c == "history":
+        resp = _call("history", {"limit": args.limit}, js)
+    elif c == "discover":
+        resp = _call("discover", {"seed": args.seed, "length": args.length,
+                                  "enqueue": args.enqueue,
+                                  "variety": args.variety}, js)
     elif c in ("pause", "resume", "toggle", "stop", "prev", "status"):
         resp = _call(c, {}, js)
     elif c == "automix":
@@ -214,13 +262,29 @@ def _print_human(c: str, resp: dict, args) -> None:
             print(f"{i:3d}. {r.get('artist') or '?'} — {r.get('title')} "
                   f"{album} ({dur}, {r.get('provider')}) id={r.get('id') or '-'}")
         return
-    if c in ("library",):
-        for r in resp.get("tracks", []):
-            dur = _fmt_seconds(r.get("duration"))
-            print(f"{r['id']:5d}. {r.get('artist') or '?'} — {r['title']} "
-                  f"[{r.get('album') or '-'}] {dur} {r.get('provider')}")
+    if c == "library":
+        kind = getattr(args, "kind", None)
+        items = resp.get(kind or "tracks", [])
+        for r in items:
+            if kind == "artists":
+                print(f"{r['id']:5d}. {r['name']}  ({r.get('n_tracks', 0)} tracks)")
+            elif kind == "albums":
+                print(f"{r['id']:5d}. {r.get('artist') or '?'} — {r['name']}  "
+                      f"({r.get('n_tracks', 0)} tracks)")
+            else:
+                dur = _fmt_seconds(r.get("duration"))
+                print(f"{r['id']:5d}. {r.get('artist') or '?'} — {r['title']} "
+                      f"[{r.get('album') or '-'}] {dur} {r.get('provider')}")
         return
     if c == "queue":
+        for q in resp.get("queue", []):
+            dur = _fmt_seconds(q.get("duration"))
+            print(f"{q.get('position', '?'):>4}. {q.get('artist') or '?'} — "
+                  f"{q.get('title')} {dur} {q.get('provider')}")
+        if resp.get("shuffled"):
+            print(f"shuffled {resp['shuffled']} track(s)")
+        return
+    if c == "shuffle":
         for q in resp.get("queue", []):
             dur = _fmt_seconds(q.get("duration"))
             print(f"{q.get('position', '?'):>4}. {q.get('artist') or '?'} — "
@@ -234,6 +298,25 @@ def _print_human(c: str, resp: dict, args) -> None:
             score = t.get("transition_score")
             sc = f" (score {score:g})" if score else ""
             print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']}{sc}")
+        return
+    if c == "discover":
+        for i, t in enumerate(resp.get("discover", []), 1):
+            print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']}")
+        return
+    if c == "history":
+        for i, t in enumerate(resp.get("history", []), 1):
+            print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']}")
+        return
+    if c == "stats":
+        lib, top = resp.get("library", {}), resp.get("top", [])
+        print(f"tracks {lib.get('tracks', 0)} · queue {lib.get('queue', 0)} · "
+              f"history {lib.get('history', 0)} · analyzed {lib.get('analyzed', 0)}")
+        for i, t in enumerate(top, 1):
+            print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']} "
+                  f"({t.get('play_count', 0)} plays)")
+        return
+    if c == "seek":
+        print(f"position: {resp.get('position', '?')}s / {resp.get('duration') or '??:??'}s")
         return
     if c == "lyrics":
         print(resp.get("lyrics") or "(no lyrics found)")
@@ -254,7 +337,85 @@ def _print_human(c: str, resp: dict, args) -> None:
             print(f"{k}: {v}")
 
 
+def _print_completions(shell: str) -> int:
+    """Print a completion script (spec §4: shell-completion). Static command
+    list; per-argument values (track ids, playlist names) are not completed."""
+    cmds = ("play pause resume toggle stop next prev status stats seek queue "
+            "shuffle search library import analyze playlist like unlike volume "
+            "automix automix-preview radio discover history get lyrics cover "
+            "daemon tui legal completions")
+    if shell == "bash":
+        print(f"""# muse bash completion
+_muse_completions() {{
+  local cur="${{COMP_WORDS[COMP_CWORD]}}"
+  case "${{COMP_WORDS[1]}}" in
+    queue) COMPREPLY=( $(compgen -W "list add remove shuffle clear" -- "$cur") );;
+    playlist) COMPREPLY=( $(compgen -W "list create delete add show play" -- "$cur") );;
+    automix) COMPREPLY=( $(compgen -W "on off length config bandpass vocal" -- "$cur") );;
+    daemon) COMPREPLY=( $(compgen -W "start stop status restart" -- "$cur") );;
+    completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") );;
+    *)
+      if [ "$COMP_CWORD" = 1 ]; then
+        COMPREPLY=( $(compgen -W "{cmds}" -- "$cur") )
+      fi
+      ;;
+  esac
+}}
+complete -F _muse_completions muse""")
+    elif shell == "zsh":
+        print(f"""#compdef muse
+_muse() {{
+  local -a commands
+  commands=({' '.join(cmds.split())})
+  _describe 'command' commands
+  case $words[2] in
+    (queue) _values 'action' list add remove shuffle clear;;
+    (playlist) _values 'action' list create delete add show play;;
+    (automix) _values 'action' on off length config bandpass vocal;;
+    (daemon) _values 'action' start stop status restart;;
+  esac
+}}
+compdef _muse muse""")
+    else:  # fish
+        for c in cmds.split():
+            print(f"complete -c muse -n '__fish_use_subcommand' -a '{c}'")
+        print("""complete -c muse -n '__fish_seen_subcommand_from queue' -a 'list add remove shuffle clear'
+complete -c muse -n '__fish_seen_subcommand_from automix' -a 'on off length config bandpass vocal'
+complete -c muse -n '__fish_seen_subcommand_from daemon' -a 'start stop status restart'
+complete -c muse -n '__fish_seen_subcommand_from playlist' -a 'list create delete add show play'""")
+    return 0
+
+
 def _daemon(action: str, as_json: bool) -> int:
+    if action == "status":
+        running = ipc.daemon_running()
+        print("running" if running else "not running")
+        return 0
+    if action == "stop":
+        if not ipc.daemon_running():
+            print("not running")
+            return 0
+        resp = ipc.request("daemon_stop", timeout=10.0)
+        if resp.get("ok"):
+            # wait for the socket to disappear (clean shutdown)
+            import time as _t
+            for _ in range(30):
+                if not ipc.daemon_running():
+                    break
+                _t.sleep(0.2)
+            else:
+                # graceful path failed; SIGTERM the process as a fallback
+                _terminate_daemon()
+                return 0
+            print("daemon stopped")
+            return 0
+        print(f"error: {resp.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    if action == "restart":
+        rc = _daemon("stop", as_json)
+        if rc:
+            return rc
+        return _daemon("start", as_json)
     if action == "start":
         if ipc.daemon_running():
             print("daemon already running")
@@ -273,14 +434,24 @@ def _daemon(action: str, as_json: bool) -> int:
             return 0
         print("daemon failed to start; check log", file=sys.stderr)
         return 1
-    if action == "stop":
-        resp = _call("stop")
-        ok = not _fail(resp)
-        # best-effort: kill by socket peer? prototype: signal via pid file
-        print("stopped playback; full daemon shutdown: kill the process manually")
-        return 0 if ok else 1
-    print("usage: muse daemon [start|stop]")
+    print("usage: muse daemon [start|stop|status|restart]")
     return 2
+
+
+def _terminate_daemon() -> None:
+    """Best-effort SIGTERM to muse daemon processes (fallback stop path)."""
+    import signal
+    import subprocess as _sp
+    try:
+        out = _sp.run(["pgrep", "-f", "muse.daemon.main"], capture_output=True,
+                      text=True, timeout=5).stdout.split()
+        for pid in out:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

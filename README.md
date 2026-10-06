@@ -7,8 +7,9 @@ Unix-socket JSON API.
 Implements the core of the muse spec (see conversation): playback with gapless
 advance and loudness normalization, **Smart Shuffle** (BPM/key/energy scoring,
 no repeats), **AutoMix** (beat-aligned crossfade planning + `atempo`
-transition via ffmpeg), offline **analysis** (BPM / key / LUFS / beat grid /
-sections), **yt-dlp** downloads with legal notices, lyrics + cover art
+transition via ffmpeg, with band-limited and vocal-aware modes), offline
+**analysis** (BPM / key / LUFS / beat grid / sections + Tier-2 **vocal-region
+detection**), **yt-dlp** downloads with legal notices, lyrics + cover art
 fetching/caching, macOS media keys / Linux MPRIS integration, and an Apple
 Music provider scaffold that honestly reports DRM limitations instead of
 circumventing them.
@@ -25,6 +26,13 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 Requires `ffmpeg` (decoding/analysis) and optionally `yt-dlp` (downloads) on
 your PATH.
 
+Optional — make `muse` available on your global PATH (the symlink keeps
+working from any directory; repeat after moving the project):
+
+```bash
+ln -sf "$(pwd)/.venv/bin/muse" /opt/homebrew/bin/muse   # macOS (Homebrew)
+```
+
 ## Quickstart
 
 ```bash
@@ -33,16 +41,38 @@ muse import ~/Music/mine           # import files into the library
 muse analyze --all                 # offline analysis (BPM/key/LUFS/beat grid)
 muse search "creed"                # search local library
 muse play 3                        # play track 3 (or: muse play "creed")
-muse queue add 7                   # enqueue
+muse seek 30                       # jump to 0:30 (+10 / -5 = relative seek)
 muse next                          # advance (Smart Shuffle when queue is empty)
+muse next --plain                  # advance without Smart Shuffle
+muse prev                          # restart track, or previous track if <3s in
+muse queue add 7                   # enqueue
+muse shuffle                       # shuffle the queue (alias: queue shuffle)
+muse shuffle --keep-first          # ... keeping the playing track first
 muse volume 75                     # percent volume
 muse automix on && muse automix length 8
+muse automix bandpass off          # band-limited crossfade filter (default on)
+muse automix vocal on              # vocal-aware transitions (default off)
 muse automix-preview 1 2           # dry-run transition plan (no audio)
 muse radio 5 --length 10           # build a Smart Shuffle sequence
+muse discover                      # exploration shuffle across the library
+muse discover 5 --variety 0.8      # ... seeded, wider picks, --enqueue to queue
+muse history --limit 10            # recently played
+muse stats                         # library/play-count summary + top tracks
+muse library --kind artists        # group view (artists|albums)
 muse lyrics && muse cover          # now-playing extras
 muse status                        # now playing
+muse daemon status|stop|restart    # daemon lifecycle
+muse completions bash              # shell completions (bash|zsh|fish)
 muse legal                         # YouTube / Apple notices
 muse tui                           # full-screen interface
+```
+
+Shell completions (pipe to your rc file or eval in-session):
+
+```bash
+muse completions bash  > ~/.muse-completion.bash && source ~/.muse-completion.bash
+muse completions zsh   > ~/.zfunc/_muse
+muse completions fish  > ~/.config/fish/completions/muse.fish
 ```
 
 `--json` on any command emits raw JSON for scripting.
@@ -50,11 +80,14 @@ muse tui                           # full-screen interface
 ## Architecture
 
 ```
-muse/daemon     IPC socket server + command registry (single source of truth)
+muse/daemon     IPC socket server + command registry (single source of truth);
+                0.5s service tick: gapless auto-advance and live AutoMix
+                crossfades (beat anchors, tempo scaling, band-limited filters)
 muse/audio      ffmpeg-decoder voices -> sounddevice stereo mixer
                 (fade state machine = gapless advance / AutoMix crossfade)
 muse/analysis   numpy DSP: onset autocorrelation BPM, KS-profile key,
                 R128-style loudness, beat grid, sections; tiered worker
+                vocals.py: Tier-2 vocal-region detection (quantile spectra)
 muse/smart      Smart Shuffle scorer + AutoMix transition planner
 muse/providers  local | youtube (yt-dlp) | apple (MusicKit scaffold)
                 | lyrics (LRCLIB) | covers (Deezer -> generated fallback)
@@ -62,14 +95,31 @@ muse/providers  local | youtube (yt-dlp) | apple (MusicKit scaffold)
 
 State: SQLite at `~/.local/share/muse/database.db`; config
 `~/.config/muse/config.toml`; analysis cache `~/.cache/muse/analysis`.
+Honors `MUSE_SOCKET` to relocate the IPC socket (daemon and clients both).
+
+### Vocal detection (Tier-2)
+
+The analysis worker runs a vocal pass on the last ~90s of audio by default:
+~1s segments of 25th-percentile spectra (transient-robust — drums and clicks
+fall below the quantile and vanish), scored by midband/treble energy share,
+spectral spread, and prominent-partial count in the 300–3400 Hz band. Produces
+`vocal_regions` plus `vocal_intro_sec` / `vocal_end_sec`, which the AutoMix
+planner uses in vocal mode to prefer mixing into instrumental windows of the
+incoming track (avoiding mid-song lyrical collisions).
+
+### TUI
+
+`muse tui` is a tabbed interface (Search / Queue / Library / Playlists) with a
+now-playing header, transport keys, and live status from the daemon.
 
 ## Offline / CI mode
 
 Set `MUSE_OFFLINE=1` — no network calls (search, downloads, lyrics, covers all
 degrade gracefully). Synthetic test signals (`tests/conftest.py`,
 `muse/analysis/synth.py`) make the whole test suite deterministic and
-network-free: `muse analyze` and AutoMix planning are validated against
-click-tracks at known BPM and chord pads in known keys.
+network-free: `muse analyze`, the vocal detector, and AutoMix planning are
+validated against click-tracks at known BPM, harmonic-vocal surrogates, and
+chord pads in known keys.
 
 ## Tests
 
@@ -84,3 +134,6 @@ click-tracks at known BPM and chord pads in known keys.
 - Smart Shuffle pool is library-local; artist/genre embeddings are future work.
 - MPRIS is registered as a minimal prototype (play/pause/next only).
 - `atempo` time-stretch is applied during AutoMix, limited to ±4% adjustments.
+- Band-limited crossfade filters are one-pole block-form DSP; block boundary
+  decomposition differs inherently from single-block processing (documented in
+  `tests/test_features_wave2.py`).

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sqlite3
 import time
 from pathlib import Path
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS analysis (
   bpm REAL, key TEXT, loudness REAL, energy REAL,
   intro_sec REAL, outro_sec REAL, beat_count INTEGER,
   beat_grid TEXT, structure TEXT, tiers_done INTEGER NOT NULL DEFAULT 0,
+  vocal_regions TEXT, vocal_intro_sec REAL, vocal_end_sec REAL,
   completed_at REAL
 );
 CREATE TABLE IF NOT EXISTS providers (
@@ -75,6 +77,8 @@ DEFAULTS = {
     "volume": "0.8",
     "automix_enabled": "1",
     "automix_transition_length": "8",
+    "automix_bandpass": "1",
+    "automix_vocal_mode": "0",
     "shuffle_smart": "1",
 }
 
@@ -88,6 +92,14 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # migrate DBs created before vocal tiers (schema-only ALTERs are idempotent)
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(analysis)").fetchall()}
+        for col, decl in (
+            ("vocal_regions", "TEXT"), ("vocal_intro_sec", "REAL"),
+            ("vocal_end_sec", "REAL"),
+        ):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE analysis ADD COLUMN {col} {decl}")
         for k, v in DEFAULTS.items():
             self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
         self.conn.commit()
@@ -228,6 +240,31 @@ class Database:
             rows = self.conn.execute("SELECT id FROM tracks").fetchall()
         return [r["id"] for r in rows]
 
+    def list_artists(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT a.id, a.name, COUNT(t.id) AS n_tracks FROM artists a "
+            "LEFT JOIN tracks t ON t.artist_id = a.id "
+            "GROUP BY a.id ORDER BY a.name").fetchall()
+        return [dict(r) for r in rows]
+
+    def list_albums(self, artist: str | None = None) -> list[dict]:
+        if artist:
+            rows = self.conn.execute(
+                "SELECT al.id, al.name, a.name AS artist, al.cover_art_path, "
+                "COUNT(t.id) AS n_tracks FROM albums al "
+                "LEFT JOIN artists a ON a.id = al.artist_id "
+                "LEFT JOIN tracks t ON t.album_id = al.id "
+                "WHERE a.name LIKE ? GROUP BY al.id ORDER BY a.name, al.name",
+                (f"%{artist}%",)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT al.id, al.name, a.name AS artist, al.cover_art_path, "
+                "COUNT(t.id) AS n_tracks FROM albums al "
+                "LEFT JOIN artists a ON a.id = al.artist_id "
+                "LEFT JOIN tracks t ON t.album_id = al.id "
+                "GROUP BY al.id ORDER BY a.name, al.name").fetchall()
+        return [dict(r) for r in rows]
+
     # -- analysis -----------------------------------------------------------
     def has_analysis(self, track_id: int, tiers: int) -> bool:
         row = self.conn.execute(
@@ -238,7 +275,8 @@ class Database:
     def save_analysis(self, track_id: int, **fields) -> None:
         allowed = {
             "bpm", "key", "loudness", "energy", "intro_sec", "outro_sec",
-            "beat_count", "beat_grid", "structure", "tiers_done", "completed_at",
+            "beat_count", "beat_grid", "structure", "tiers_done",
+            "vocal_regions", "vocal_intro_sec", "vocal_end_sec", "completed_at",
         }
         cols, vals = [], []
         for k, v in fields.items():
@@ -249,7 +287,7 @@ class Database:
                     v = v.item()
                 except (AttributeError, ValueError):
                     pass
-            if k in ("beat_grid", "structure") and isinstance(v, (list, tuple, dict)):
+            if k in ("beat_grid", "structure", "vocal_regions") and isinstance(v, (list, tuple, dict)):
                 v = json.dumps(v)
             cols.append(k)
             vals.append(v)
@@ -273,7 +311,7 @@ class Database:
         if not row:
             return None
         d = dict(row)
-        for jf in ("beat_grid", "structure"):  # stored as JSON text
+        for jf in ("beat_grid", "structure", "vocal_regions"):  # stored as JSON text
             if d.get(jf) and isinstance(d[jf], str):
                 try:
                     d[jf] = json.loads(d[jf])
@@ -323,6 +361,12 @@ class Database:
         )
         self.conn.commit()
 
+    def peek_queue_head(self) -> int | None:
+        row = self.conn.execute(
+            "SELECT track_id FROM queue ORDER BY position LIMIT 1"
+        ).fetchone()
+        return row["track_id"] if row else None
+
     def pop_queue_head(self) -> int | None:
         row = self.conn.execute(
             "SELECT position, track_id FROM queue ORDER BY position LIMIT 1"
@@ -336,6 +380,32 @@ class Database:
         )
         self.conn.commit()
         return row["track_id"]
+
+    def shuffle_queue(self, keep_first: bool = False) -> int:
+        """Fisher-Yates over queue rows. `keep_first` protects position 1
+        (the currently playing/loading track). Returns number of entries."""
+        rows = self.conn.execute(
+            "SELECT position, track_id FROM queue ORDER BY position").fetchall()
+        items = [(r["position"], r["track_id"]) for r in rows]
+        if len(items) < 2:
+            return len(items)
+        lo = 1 if (keep_first and items[0][0] == 1) else 0
+        idx = list(range(len(items)))
+        for i in range(len(items) - 1, lo, -1):
+            j = random.randint(lo, i)
+            idx[i], idx[j] = idx[j], idx[i]
+        # park every row in unique negative space (UNIQUE per-row semantics),
+        # then reassign final positions 1..n row by row
+        for pos, _ in items:
+            self.conn.execute(
+                "UPDATE queue SET position = ? WHERE position = ?", (-pos - 1, pos))
+        for new_pos, (old_pos, _) in enumerate(
+                (items[k] for k in idx), start=1):
+            self.conn.execute(
+                "UPDATE queue SET position = ? WHERE position = ?",
+                (new_pos, -old_pos - 1))
+        self.conn.commit()
+        return len(items)
 
     def remove_from_queue(self, position: int) -> int | None:
         row = self.conn.execute(
@@ -361,6 +431,42 @@ class Database:
             (time.time(), track_id, position),
         )
         self.conn.commit()
+
+    def history_tracks(self, limit: int = 50) -> list[dict]:
+        """Recent plays, newest first (deduped; spec §4 `history`)."""
+        rows = self.conn.execute(
+            "SELECT MAX(h.play_time) AS played_at, h.track_id "
+            "FROM history h GROUP BY h.track_id ORDER BY played_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            t = self.get_track(r["track_id"])
+            if t:
+                t["played_at"] = r["played_at"]
+                out.append(t)
+        return out
+
+    def pop_last_played(self, exclude_id: int | None = None) -> int | None:
+        """Undo newest history entries until one names a track other than
+        `exclude_id` (the track usually plays again after the skip); returns
+        its track id. Skipped rows are deleted without decrementing."""
+        while True:
+            row = self.conn.execute(
+                "SELECT h.rowid AS rid, h.track_id AS tid, h.position AS pos "
+                "FROM history h ORDER BY h.play_time DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            self.conn.execute("DELETE FROM history WHERE rowid = ?", (row["rid"],))
+            if exclude_id is not None and row["tid"] == exclude_id:
+                continue  # the current track's own entry: drop silently
+            self.conn.execute(
+                "UPDATE tracks SET play_count = MAX(play_count - 1, 0) WHERE id = ?",
+                (row["tid"],),
+            )
+            self.conn.commit()
+            return row["tid"]
 
     # -- playlists -------------------------------------------------------------
     def create_playlist(self, name: str, smart: bool = False) -> int:

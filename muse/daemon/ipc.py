@@ -15,6 +15,11 @@ SOCKET_NAME = "muse.sock"
 
 def socket_path() -> str:
     import tempfile
+    # MUSE_SOCKET overrides (daemon main.py consumes it too) — keeps custom
+    # sockets working across daemon *and* client
+    override = os.environ.get("MUSE_SOCKET")
+    if override:
+        return override
     return os.path.join(tempfile.gettempdir(), SOCKET_NAME)
 
 

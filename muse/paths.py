@@ -69,6 +69,18 @@ def offline() -> bool:
     return os.environ.get("MUSE_OFFLINE", "0") not in ("", "0", "false", "no")
 
 
+def read_config() -> dict:
+    """Parse ~/.config/muse/config.toml; {} on absence or parse errors."""
+    try:
+        import tomllib
+        with open(config_path(), "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
 DEFAULT_CONFIG = """\
 [audio]
 backend = "sounddevice"

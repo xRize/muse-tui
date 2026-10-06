@@ -10,6 +10,29 @@ from muse import db as dbmod
 log = logging.getLogger("muse.analysis")
 
 
+def audio_for_vocals(path: str, seconds: float = 90.0):
+    """Decode the last 90s (where AutoMix overlap planning needs vocal info)."""
+    from muse.analysis.decoder import ffprobe_duration
+
+    dur = ffprobe_duration(path)
+    if dur and dur > seconds:
+        import subprocess
+
+        import numpy as np
+
+        from muse.analysis.decoder import FFMPEG
+        sr = 22050
+        proc = subprocess.run(
+            [FFMPEG, "-v", "error", "-nostdin", "-ss", f"{dur - seconds:g}",
+             "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(sr), "pipe:1"],
+            capture_output=True, check=True)
+        audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+        if audio.size:
+            return audio
+    from muse.analysis.decoder import decode
+    return decode(path, sr=22050, max_seconds=seconds)
+
+
 def read_metadata(path: Path) -> dict:
     """Best-effort tag/duration read via mutagen (MP3/FLAC/M4A/OGG/...)."""
     title = artist = album = None
@@ -91,6 +114,18 @@ def run_analysis(database: dbmod.Database, track_id: int, tiers: int = 2) -> boo
         database.save_analysis(track_id, tiers_done=0, bpm=0.0, key="", loudness=-70.0,
                                energy=0.0, beat_grid=[], beat_count=0, structure={})
         return False
+    try:
+        from muse.analysis.vocals import vocal_end_sec, vocal_intro_sec, vocal_regions
+
+        regions = vocal_regions(audio_for_vocals(path))
+        database.save_analysis(
+            track_id,
+            vocal_regions=regions,
+            vocal_intro_sec=vocal_intro_sec(regions),
+            vocal_end_sec=vocal_end_sec(regions),
+        )
+    except Exception as e:  # vocal pass is best-effort Tier-2
+        log.debug("vocal analysis failed for track %s: %s", track_id, e)
     database.save_analysis(
         track_id,
         bpm=result["bpm"],

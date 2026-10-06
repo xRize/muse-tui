@@ -11,11 +11,15 @@ MAX_TEMPO_ADJUST = 0.04  # beyond ±4%, don't time-stretch; plain crossfade
 
 
 def plan_transition(a: dict, b: dict, transition_length: float = 8.0,
-                    beat_match: bool = True, harmonic_match: bool = True) -> dict:
+                    beat_match: bool = True, harmonic_match: bool = True,
+                    vocal_mode: bool = False) -> dict:
     """Plan A -> B from cached analysis dicts. Returns a printable plan dict.
 
     Returns keys: overlap_sec, tempo_scale (1.0 = none), a_end_sec, b_start_sec,
     alignment (A anchor time -> B start), curve, score, score_label, notes.
+
+    vocal_mode (spec §3 Tier-2): uses cached vocal regions so A's vocals are
+    not faded mid-line and B's first vocal ideally waits until the overlap ends.
     """
     notes: list[str] = []
     bpm_a = a.get("bpm") or 0
@@ -49,16 +53,29 @@ def plan_transition(a: dict, b: dict, transition_length: float = 8.0,
         window = min(8 * 4 * 60.0 / bpm_a, dur_a * 0.25) if bpm_a else 8.0
         lo = max(0.0, target - window)
         hi = min(dur_a, target + window)
+
+        # vocal_mode: never fade A mid-phrase — anchor on the beat nearest to
+        # A's last vocal end (an instrumental tail carries the transition)
+        vocal_end = (a.get("vocal_end_sec") or 0) if vocal_mode else 0.0
+        if vocal_end and dur_a and vocal_end < dur_a - 0.5:
+            target = max(vocal_end, dur_a - 1.5 * transition_length)
+        # grid is phase-locked, so choose nearest bar-aligned beat (every 4th)
+        downbeats = grid_a[::4]
         anchors = [t for t in grid_a if lo <= t <= hi]
-        if anchors:
-            # pick the strongest anchor closest to target — grid is phase-locked,
-            # so choose nearest bar-aligned beat (every 4th)
-            downbeats = grid_a[::4]
-            cands = [t for t in downbeats if lo <= t <= hi] or anchors
-            a_end = min(cands, key=lambda t: abs(t - target))
-            notes.append(f"beat align at A[{a_end:g}s]")
+        cands = [t for t in downbeats if lo <= t <= hi] or anchors
+        if cands:
+            closest = min(cands, key=lambda t: abs(t - target))
+            if vocal_end and abs(closest - target) > window:
+                closest = None
+            if closest is not None:
+                a_end = closest
+                notes.append(f"beat align at A[{a_end:g}s]")
+            else:
+                notes.append("no downbeat in window; using outro end")
         else:
-            notes.append("no downbeat in window; using outro end")
+            a_end = target if vocal_end else dur_a
+            if a_end and not vocal_end:
+                notes.append("no downbeat in window; using outro end")
     else:
         if beat_match and not grid_a:
             notes.append("no beat grid; using outro end")
@@ -67,6 +84,20 @@ def plan_transition(a: dict, b: dict, transition_length: float = 8.0,
     b_start = max(0.0, intro_b * 0.5) if intro_b else 0.0
     if intro_b:
         notes.append(f"skip {b_start:g}s of B's intro")
+
+    # --- vocal awareness (spec §3 'vocal avoidance') --------------------------
+    if vocal_mode:
+        overlap = transition_length
+        a_vent = a.get("vocal_end_sec") or 0.0
+        if a_vent and dur_a and (dur_a - a_vent) < 1.0 \
+                and a_end and (a_end - overlap) < a_vent:
+            overlap = max(2.0, round(overlap / 2, 1))
+            notes.append("A's vocals run to the end; halving overlap")
+        b1v = b.get("vocal_intro_sec") or 0.0
+        if b1v and b1v < overlap:
+            overlap = b1v  # B starts singing inside the overlap; shorten it
+            notes.append(f"B's first vocal at {b1v:g}s; overlap shortened")
+        transition_length = overlap
 
     # --- harmony / score ------------------------------------------------------
     key_a, key_b = a.get("key") or "", b.get("key") or ""
@@ -110,6 +141,8 @@ def plan_transition(a: dict, b: dict, transition_length: float = 8.0,
         "key_b": key_b,
         "camelot_a": camelot_label(key_a) if key_a else "?",
         "camelot_b": camelot_label(key_b) if key_b else "?",
+        "a_vocal_end": a.get("vocal_end_sec"),
+        "b_vocal_intro": b.get("vocal_intro_sec"),
         "notes": notes,
     }
 
@@ -125,6 +158,10 @@ def format_plan(a_title: str, b_title: str, plan: dict) -> str:
     ]
     if plan["tempo_scale"] != 1.0:
         lines.append(f"  Tempo scale on B: x{plan['tempo_scale']:.4f}")
+    if plan.get("a_vocal_end") is not None and plan.get("b_vocal_intro") is not None:
+        lines.append(
+            f"  Vocal crossfade: A's vocals end at {plan['a_vocal_end']:g}s, "
+            f"B's vocals enter at {plan['b_vocal_intro']:g}s")
     for n in plan["notes"]:
         lines.append(f"  - {n}")
     lines.append(f"Transition Score: {plan['score']:g}/100 ({plan['score_label']})")

@@ -93,6 +93,8 @@ def smart_shuffle_next(database: dbmod.Database, current_track_id: int | None,
             continue
         ts = transition_score(cur or {}, cand, pool_size) if cur else 60.0
         scored.append((ts, cand))
+    if not scored:
+        return None  # only candidate is the current track itself
     scored.sort(key=lambda x: -x[0])
     top = scored[: max(1, min(top_k, len(scored)))]
     # score-weighted randomization: a clear winner is picked almost always,
