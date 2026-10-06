@@ -669,6 +669,28 @@ class MuseCommands:
             db.add_to_queue([t["id"] for t in seq])
         return {"radio": [self._track_view(t, db) for t in seq]}
 
+    def cmd_genq(self, ref: str | None = None, length: int = 5,
+                 enqueue: bool = True) -> dict:
+        """Generate Queue: similar songs (BPM/key/energy/genre, scored) for the
+        playing track (or `ref`), queued at the head so they play next."""
+        db = self.db()
+        eng = self.engine
+        seed = None
+        if ref:
+            rows = self._resolve_tracks(db, ref)
+            if not rows:
+                return {"error": f"no match for {ref!r}"}
+            seed = rows[0]["id"]
+        elif eng and eng.current:
+            seed = eng.current.track_id
+        if seed is None:
+            return {"error": "nothing playing — pass a track id or query"}
+        picks = shuffle_mod.similar_tracks(db, seed, length=length)
+        if enqueue and picks:
+            db.add_to_queue([t["id"] for t in picks], at=1)
+        return {"generated": [self._track_view(t, db) for t in picks],
+                "seed": seed}
+
     # -- get / lyrics / covers ----------------------------------------------------
     def cmd_get(self, url: str, on_progress=None) -> dict:
         from muse.providers import youtube as yt
@@ -952,7 +974,7 @@ class MuseCommands:
             "id": t["id"], "title": t["title"], "artist": t.get("artist"),
             "album": t.get("album"), "duration": t.get("duration"),
             "provider": t.get("provider"), "liked": t.get("liked", 0),
-            "position": t.get("position"),
+            "position": t.get("position"), "genre": t.get("genre"),
             "bpm": a.get("bpm"), "key": a.get("key"),
             "vocal_end": a.get("vocal_end_sec"), "vocal_intro": a.get("vocal_intro_sec"),
         }

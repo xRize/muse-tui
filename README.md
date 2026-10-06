@@ -54,6 +54,9 @@ muse automix bandpass off          # band-limited crossfade filter (default on)
 muse automix vocal on              # vocal-aware transitions (default off)
 muse automix-preview 1 2           # dry-run transition plan (no audio)
 muse radio 5 --length 10           # build a Smart Shuffle sequence
+muse genq                          # Generate Queue: similar tracks queued next
+muse genq 5 --length 8             # ... seeded by track 5, 8 picks
+muse genq --no-enqueue             # preview the ranked matches only
 muse discover                      # exploration shuffle across the library
 muse discover 5 --variety 0.8      # ... seeded, wider picks, --enqueue to queue
 muse history --limit 10            # recently played
@@ -130,6 +133,38 @@ Downloads always print the legal notice (see `muse legal`): for
 personal/archival use only — respect YouTube ToS and copyright; muse does not
 process DRM-protected streams.
 
+## Local import & library integrity
+
+`muse import` copies each source file into muse's managed library dir
+(`~/.local/share/muse/library/<Artist>/<stem> [<hash>].<ext>` — readable
+original name + content-hash suffix) and references the copy, so the library
+keeps working even when the original file moves or is deleted. Importing the
+same content again is idempotent (same hash → same copy → same track row).
+Genre tags (TCON) are preserved and shown in the queue/library listings.
+
+On every daemon start a quick integrity check deletes library entries whose
+file is missing (metadata-only rows, e.g. un-downloaded YouTube refs, are
+kept); queue/history/playlist entries cascade. `analyze --all` runs the same
+check first, so dead rows can never clog the analysis batch.
+
+## Generate Queue
+
+With a track playing (or any track as the seed), Generate Queue ranks every
+analyzed library track by BPM/key/energy transition score **plus a genre-tag
+bonus**, then queues the best matches (default 5) to play next —
+"BPM 120 → 122, Rock → Rock" style transitions. A quiet library yields a
+short queue rather than junk: matches below the score gate are dropped.
+
+```bash
+muse genq                # seed = now playing; queue top matches at the head
+muse genq 5 --length 8   # seed by track id or search query
+muse genq --no-enqueue   # preview scores without queueing
+```
+
+In the TUI, press `G` on the Queue tab to generate from the playing track.
+Generated picks show their transition scores; only analyzed tracks are
+candidates (run `muse analyze --all` first).
+
 ## Architecture
 
 ```
@@ -189,6 +224,8 @@ chord pads in known keys.
 - Apple Music playback is intentionally unimplemented (DRM); provider syncs
   metadata and reports why playback can't happen.
 - Smart Shuffle pool is library-local; artist/genre embeddings are future work.
+- Generate Queue candidates are scored only when analysis exists; unanalyzed
+  tracks are skipped (run `muse analyze --all` to widen the pool).
 - MPRIS is registered as a minimal prototype (play/pause/next only).
 - `atempo` time-stretch is applied during AutoMix, limited to ±4% adjustments.
 - Band-limited crossfade filters are one-pole block-form DSP; block boundary

@@ -73,6 +73,14 @@ def main() -> int:
     cmds = enable_shared_registry()
     cmds.audio_engine()      # start engine now (not lazily on first play)
     cmds.db()
+    # startup integrity check: drop library entries whose file vanished
+    try:
+        gone = cmds.db().prune_missing_files()
+        if gone:
+            log.info("pruned %d library entr(y/ies) with missing files: %s",
+                     len(gone), gone)
+    except Exception:
+        log.exception("startup integrity prune failed")
     # first-run: write default config.toml if absent (spec §2)
     try:
         cfg = paths.config_path()

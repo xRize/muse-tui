@@ -35,7 +35,7 @@ def audio_for_vocals(path: str, seconds: float = 90.0):
 
 def read_metadata(path: Path) -> dict:
     """Best-effort tag/duration read via mutagen (MP3/FLAC/M4A/OGG/...)."""
-    title = artist = album = None
+    title = artist = album = genre = None
     year = track_number = None
     duration = 0.0
     try:
@@ -50,6 +50,8 @@ def read_metadata(path: Path) -> dict:
                 artist = str(tags["artist"][0])
             if tags.get("album"):
                 album = str(tags["album"][0])
+            if tags.get("genre"):
+                genre = str(tags["genre"][0])
             if tags.get("date"):
                 try:
                     year = int(str(tags["date"][0])[:4])
@@ -62,24 +64,56 @@ def read_metadata(path: Path) -> dict:
                     pass
     except Exception:
         pass
-    return {"title": title, "artist": artist, "album": album, "duration": duration,
-            "year": year, "track_number": track_number}
+    return {"title": title, "artist": artist, "album": album,
+            "duration": duration, "year": year, "track_number": track_number,
+            "genre": genre}
 
 
 def import_file(database: dbmod.Database, path: str | Path) -> int | None:
-    """Import a single audio file into the library. Returns track_id or None."""
-    path = Path(path).expanduser()
-    meta = read_metadata(path)
-    track_id = database.upsert_track(
-        title=meta["title"] or path.stem,
+    """Import a single audio file into the library. Returns track_id or None.
+
+    The file is copied into the managed library dir (paths.library_dir) so
+    the library keeps working even when the original moves/deletes; the copy
+    becomes the canonical file_path (re-importing the same source is
+    idempotent — same content hash maps to the same target path)."""
+    src = Path(path).expanduser()
+    canonical = _library_copy(src)
+    meta = read_metadata(canonical)
+    return database.upsert_track(
+        title=meta["title"] or canonical.stem,
         artist=meta["artist"],
         album=meta["album"],
         duration=meta["duration"] or None,
-        file_path=str(path),
+        file_path=str(canonical),
         year=meta["year"],
         track_number=meta["track_number"],
+        genre=meta["genre"],
     )
-    return track_id
+
+
+def _library_copy(src: Path) -> Path:
+    """Copy src into paths.library_dir (<Artist> subdir) as
+    '<stem> [<hash16>].<ext>': readable original name, and re-importing the
+    identical content maps to the same canonical path (idempotent)."""
+    import hashlib
+
+    import muse.paths as muse_paths
+
+    try:
+        data = src.read_bytes()
+    except OSError:
+        return src  # unreadable: import will fail naturally downstream
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    meta = read_metadata(src)
+    artist = meta.get("artist") or "Unknown Artist"
+    safe_artist = "".join(c for c in artist if c not in '/\\:*?"<>|').strip() \
+        or "Unknown Artist"
+    dest_dir = muse_paths.library_dir() / safe_artist
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{src.stem} [{digest}]{src.suffix.lower() or '.audio'}"
+    if not dest.exists():
+        dest.write_bytes(data)
+    return dest
 
 
 def import_directory(database: dbmod.Database, root: str | Path) -> list[int]:
@@ -143,7 +177,12 @@ def run_analysis(database: dbmod.Database, track_id: int, tiers: int = 2) -> boo
 
 
 def analyze_pending(database: dbmod.Database, tiers: int = 2, limit: int = 50) -> list[int]:
-    """Analyze up to `limit` tracks missing analysis."""
+    """Analyze up to `limit` tracks missing analysis.
+
+    Missing files are pruned first: without this, dead rows occupy the
+    pending batch head but fail `run_analysis` invisibly, and once 50+ such
+    rows exist `analyze --all` can never reach any live pending track."""
+    database.prune_missing_files()
     done = []
     for tid in database.pending_analysis(tiers=tiers, limit=limit):
         if run_analysis(database, tid, tiers=tiers):

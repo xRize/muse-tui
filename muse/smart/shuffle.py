@@ -14,6 +14,24 @@ W_KEY = 0.25
 W_ENERGY = 0.20
 W_REPEAT = 0.15
 W_LIKE = 0.05
+# generate-queue bonus for same/similar genre (added to transition_score)
+W_GENRE = 8.0
+
+
+def genre_bonus(a: dict, b: dict) -> float:
+    """0..W_GENRE: same genre tag scores full, shared words partial."""
+    ga = (a.get("genre") or "").strip().lower()
+    gb = (b.get("genre") or "").strip().lower()
+    if not ga or not gb:
+        return 0.0
+    if ga == gb:
+        return W_GENRE
+    wa, wb = set(ga.replace("-", " ").replace("/", " ").split()), \
+        set(gb.replace("-", " ").replace("/", " ").split())
+    overlap = wa & wb
+    if overlap:
+        return round(W_GENRE * len(overlap) / max(len(wa | wb), 1), 1)
+    return 0.0
 
 
 def bpm_score(bpm_a: float, bpm_b: float) -> float:
@@ -122,3 +140,38 @@ def radio_sequence(database: dbmod.Database, seed_track_id: int | None,
         picked.add(pick["id"])
         cur_id = pick["id"]
     return seq
+
+
+def similar_tracks(database: dbmod.Database, seed_track_id: int,
+                   length: int = 5, min_score: float = 40.0,
+                   exclude_ids: set[int] | None = None) -> list[dict]:
+    """Best transition-scored matches for a seed (Generate Queue).
+
+    Candidates are ranked by transition_score plus a genre bonus ("similar
+    in genre, bpm ... good transition score"); only matches scoring at least
+    `min_score` are returned so a quiet library yields a short queue rather
+    than junk. Scored candidates also carry their score in 'transition_score'.
+    """
+    exclude = set(exclude_ids or set()) | {seed_track_id}
+    seed_rows = load_features(database, [seed_track_id])
+    if not seed_rows:
+        return []
+    seed = seed_rows[0]
+    scored = []
+    for tid in database.all_track_ids():
+        if tid in exclude:
+            continue
+        cand_rows = load_features(database, [tid])
+        if not cand_rows:
+            continue
+        cand = cand_rows[0]
+        # unanalyzed candidates can't guarantee a good transition: skip them
+        a = cand.get("analysis") or {}
+        if not a.get("bpm"):
+            continue
+        ts = transition_score(seed, cand) + genre_bonus(seed, cand)
+        if ts >= min_score:
+            cand["transition_score"] = round(ts, 1)
+            scored.append(cand)
+    scored.sort(key=lambda t: -t["transition_score"])
+    return scored[:length]

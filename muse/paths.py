@@ -70,6 +70,13 @@ def download_dir() -> Path:
     return d
 
 
+def library_dir() -> Path:
+    """Managed library copy target for imports (XDG data, inside backups)."""
+    d = data_dir() / "library"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def offline() -> bool:
     return os.environ.get("MUSE_OFFLINE", "0") not in ("", "0", "false", "no")
 

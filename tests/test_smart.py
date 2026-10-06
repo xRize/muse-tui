@@ -76,6 +76,54 @@ def test_radio_sequence_no_immediate_repeats(db, tmp_dirs):
     assert len(set(got)) == 6, "radio must not repeat within a sequence"
 
 
+# -- generate queue (metadata-QoL wave 2) ----------------------------------------
+def test_genre_bonus(db):
+    from muse.smart.shuffle import genre_bonus
+    a = {"genre": "Rock"}
+    assert genre_bonus(a, {"genre": "rock"}) == genre_bonus(a, {"genre": "Rock"})
+    assert genre_bonus(a, {"genre": "Pop"}) == 0.0
+    assert genre_bonus(a, {"genre": None}) == 0.0
+    # shared word partial credit ("Hip-Hop" vs "Hip Hop")
+    assert 0.0 < genre_bonus({"genre": "Hip-Hop"}, {"genre": "Hip Hop"}) <= \
+        __import__("muse.smart.shuffle", fromlist=["W_GENRE"]).W_GENRE
+
+
+def test_similar_tracks_ranks_and_scores(db, tmp_dirs):
+    """Generate Queue pool: same-BPM/key candidates outrank clashing ones,
+    same-genre gets a bonus, low-scoring junk is excluded."""
+    from muse.smart import shuffle as S
+
+    seed = db.upsert_track(title="Seed", file_path="/tmp/seed.wav",
+                           genre="Rock")
+    db.save_analysis(seed, bpm=120.0, key="Amin", energy=0.5, tiers_done=2)
+    good = db.upsert_track(title="Good", file_path="/tmp/good.wav",
+                           genre="Rock")
+    db.save_analysis(good, bpm=122.0, key="Amin", energy=0.48, tiers_done=2)
+    good_nogenre = db.upsert_track(title="GoodNG", file_path="/tmp/gn.wav")
+    db.save_analysis(good_nogenre, bpm=121.0, key="Amin", energy=0.5, tiers_done=2)
+    bad = db.upsert_track(title="Bad", file_path="/tmp/bad.wav", genre="Pop")
+    db.save_analysis(bad, bpm=175.0, key="C#maj", energy=0.05, tiers_done=2)
+
+    picks = S.similar_tracks(db, seed, length=5)
+    ids = [t["id"] for t in picks]
+    assert good in ids and good_nogenre in ids
+    assert bad not in ids, "clash must stay below the min-score gate"
+    # genre bonus lifts the same-genre match above the equally-tempoed one
+    assert ids.index(good) < ids.index(good_nogenre)
+    for t in picks:
+        assert t["transition_score"] >= 40.0
+
+
+def test_similar_tracks_excludes_seed_and_unanalyzed(db, tmp_dirs):
+    from muse.smart import shuffle as S
+    seed = db.upsert_track(title="Seed", file_path="/tmp/s.wav")
+    db.save_analysis(seed, bpm=120.0, key="Amin", energy=0.5, tiers_done=2)
+    no_analysis = db.upsert_track(title="Raw", file_path="/tmp/raw.wav")
+    picks = S.similar_tracks(db, seed, length=5)
+    assert seed not in [t["id"] for t in picks]
+    assert no_analysis not in [t["id"] for t in picks]
+
+
 def test_automix_plan_beat_alignment(tmp_dirs):
     import os
 

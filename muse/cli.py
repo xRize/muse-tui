@@ -123,6 +123,12 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--length", type=int, default=12)
     sp.add_argument("--no-enqueue", action="store_true")
 
+    sp = mk("genq", help="Generate Queue: similar songs around the playing "
+                         "track, queued to play next")
+    sp.add_argument("ref", nargs="?")
+    sp.add_argument("--length", type=int, default=5)
+    sp.add_argument("--no-enqueue", action="store_true")
+
     sp = mk("discover", help="exploration shuffle across the library (spec §4)")
     sp.add_argument("seed", nargs="?")
     sp.add_argument("--length", type=int, default=12)
@@ -245,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     elif c == "radio":
         resp = _call("radio", {"ref": args.ref, "length": args.length,
                                "enqueue": not args.no_enqueue}, js)
+    elif c == "genq":
+        resp = _call("genq", {"ref": args.ref, "length": args.length,
+                              "enqueue": not args.no_enqueue}, js)
     elif c == "get":
         resp = _call("yt_get", {"ref": args.url, "playlist": args.playlist,
                                 "workers": args.workers}, js)
@@ -334,14 +343,16 @@ def _print_human(c: str, resp: dict, args) -> None:
                       f"({r.get('n_tracks', 0)} tracks)")
             else:
                 dur = _fmt_seconds(r.get("duration"))
+                genre = f" [{r.get('genre')}]" if r.get("genre") else ""
                 print(f"{r['id']:5d}. {r.get('artist') or '?'} — {r['title']} "
-                      f"[{r.get('album') or '-'}] {dur} {r.get('provider')}")
+                      f"{genre} [{r.get('album') or '-'}] {dur} {r.get('provider')}")
         return
     if c == "queue":
         for q in resp.get("queue", []):
             dur = _fmt_seconds(q.get("duration"))
+            genre = f" [{q.get('genre')}]" if q.get("genre") else ""
             print(f"{q.get('position', '?'):>4}. {q.get('artist') or '?'} — "
-                  f"{q.get('title')} {dur} {q.get('provider')}")
+                  f"{q.get('title')}{genre} {dur} {q.get('provider')}")
         if resp.get("shuffled"):
             print(f"shuffled {resp['shuffled']} track(s)")
         return
@@ -359,6 +370,17 @@ def _print_human(c: str, resp: dict, args) -> None:
             score = t.get("transition_score")
             sc = f" (score {score:g})" if score else ""
             print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']}{sc}")
+        return
+    if c == "genq":
+        picks = resp.get("generated", [])
+        if not picks:
+            print("no similar tracks found (needs analyzed library)")
+            return
+        for i, t in enumerate(picks, 1):
+            score = t.get("transition_score")
+            sc = f" (score {score:g})" if score else ""
+            print(f"{i:3d}. {t.get('artist') or '?'} — {t['title']}{sc}")
+        print("queued to play next")
         return
     if c == "discover":
         for i, t in enumerate(resp.get("discover", []), 1):
@@ -428,7 +450,7 @@ def _print_completions(shell: str) -> int:
     list; per-argument values (track ids, playlist names) are not completed."""
     cmds = ("play pause resume toggle stop next prev status stats seek queue "
             "shuffle search library import analyze playlist like unlike volume "
-            "automix automix-preview radio discover history get downloads "
+            "automix automix-preview radio genq discover history get downloads "
             "ytsearch lyrics cover daemon tui legal completions")
     if shell == "bash":
         print(f"""# muse bash completion

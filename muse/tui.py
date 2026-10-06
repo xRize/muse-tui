@@ -40,7 +40,10 @@ class TrackItem(ListItem):
         title = track.get("title") or "?"
         provider = track.get("provider") or "local"
         bpm = track.get("bpm")
+        genre = track.get("genre")
         meta = f"  · {bpm:g} BPM" if bpm else ""
+        if genre:
+            meta += f"  · {genre}"
         label = f"{prefix}{title}  —  {artist}  [{dur}] ({provider}){meta}"
         super().__init__(Static(label))
 
@@ -120,6 +123,7 @@ class MuseTUI(App):
         Binding("4", "tab('playlists')", "Playlists tab", show=False),
         Binding("5", "tab('downloads')", "Downloads tab", show=False),
         Binding("s", "shuffle_queue", "Shuffle queue"),
+        Binding("g", "genq", "Generate Queue"),
         Binding("d", "discover", "Discover"),
         Binding("L", "lyrics", "Lyrics"),
         Binding("a", "automix_toggle", "AutoMix"),
@@ -141,6 +145,8 @@ class MuseTUI(App):
                 yield Label("", id="search-info")
                 yield ListView(id="results")
             with TabPane("Queue", id="queue"):
+                yield Label("Enter removes a track; G generates a similar queue",
+                            id="queue-info")
                 yield ListView(id="queue-list")
             with TabPane("Library", id="library"):
                 yield ListView(id="library-list")
@@ -219,6 +225,24 @@ class MuseTUI(App):
 
     def action_shuffle_queue(self) -> None:
         self._call("queue", {"action": "shuffle", "keep_first": True})
+        self.refresh_queue()
+
+    def action_genq(self) -> None:
+        """Generate Queue: scored similar tracks queued to play next."""
+        r = self._call("genq", {"length": 5})
+        picks = r.get("generated", [])
+        info = self.query_one("#queue-info", Label)
+        if r.get("error"):
+            info.update(f"⚠ {r['error']}")
+        elif not picks:
+            info.update("no similar tracks found — analyze the library first "
+                        "(`muse analyze --all`)")
+        else:
+            names = ", ".join(
+                f"{t.get('artist') or '?'} — {t['title']}" for t in picks[:3])
+            more = f" +{len(picks) - 3}" if len(picks) > 3 else ""
+            info.update(f"generated {len(picks)} similar track(s): {names}{more}"
+                        " — queued to play next")
         self.refresh_queue()
 
     def action_discover(self) -> None:
@@ -417,6 +441,9 @@ class MuseTUI(App):
         lv.clear()
         for q in r.get("queue", []):
             lv.append(TrackItem(q, prefix=f"{q.get('position')}. "))
+        info = self.query_one("#queue-info", Label)
+        info.update(f"{len(r.get('queue', []))} queued — Enter removes; "
+                    "G generates a similar queue")
 
     def refresh_library(self) -> None:
         r = self._call("library", {"limit": 500})

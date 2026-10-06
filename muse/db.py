@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tracks (
   url TEXT,
   year INTEGER,
   track_number INTEGER,
+  genre TEXT,
   play_count INTEGER NOT NULL DEFAULT 0,
   last_played REAL,
   liked INTEGER NOT NULL DEFAULT 0,
@@ -103,6 +104,8 @@ class Database:
                 self.conn.execute(f"ALTER TABLE analysis ADD COLUMN {col} {decl}")
         if "cover_art_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}:
             self.conn.execute("ALTER TABLE tracks ADD COLUMN cover_art_path TEXT")
+        if "genre" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}:
+            self.conn.execute("ALTER TABLE tracks ADD COLUMN genre TEXT")
         for k, v in DEFAULTS.items():
             self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
         self.conn.commit()
@@ -167,6 +170,7 @@ class Database:
         year: int | None = None,
         track_number: int | None = None,
         cover_art_path: str | None = None,
+        genre: str | None = None,
     ) -> int:
         """Insert or update by file_path (local) or (provider,url). Returns track id."""
         artist_id = self.get_or_create_artist(artist) if artist else None
@@ -185,20 +189,21 @@ class Database:
                 """UPDATE tracks SET title=?, artist_id=COALESCE(?, artist_id),
                    album_id=COALESCE(?, album_id), duration=COALESCE(?, duration),
                    year=COALESCE(?, year), track_number=COALESCE(?, track_number),
-                   cover_art_path=COALESCE(?, cover_art_path)
+                   cover_art_path=COALESCE(?, cover_art_path),
+                   genre=COALESCE(?, genre)
                    WHERE id = ?""",
                 (title, artist_id, album_id, duration, year, track_number,
-                 cover_art_path, existing["id"]),
+                 cover_art_path, genre, existing["id"]),
             )
             track_id = existing["id"]
         else:
             cur = self.conn.execute(
                 """INSERT INTO tracks
                    (title, artist_id, album_id, duration, file_path, provider, url,
-                    year, track_number, cover_art_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    year, track_number, cover_art_path, genre)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (title, artist_id, album_id, duration, file_path, provider, url,
-                 year, track_number, cover_art_path),
+                 year, track_number, cover_art_path, genre),
             )
             track_id = cur.lastrowid
         if cover_art_path and album_id:
@@ -235,6 +240,23 @@ class Database:
     def delete_track(self, track_id: int) -> None:
         self.conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
         self.conn.commit()
+
+    def prune_missing_files(self) -> list[int]:
+        """Integrity check on startup: delete entries whose audio file vanished
+        (queue/history/playlists rows cascade via FK). Rows without a local
+        path (metadata-only) are kept. Returns removed ids."""
+        gone = []
+        rows = self.conn.execute(
+            "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL").fetchall()
+        for r in rows:
+            p = Path(str(r["file_path"]).replace("~", str(Path.home())))
+            if not p.is_file():
+                gone.append(r["id"])
+        for tid in gone:
+            self.conn.execute("DELETE FROM tracks WHERE id = ?", (tid,))
+        if gone:
+            self.conn.commit()
+        return gone
 
     def all_track_ids(self, provider: str | None = None) -> list[int]:
         if provider:
@@ -531,7 +553,8 @@ class Database:
 _TRACK_QUERY = """
 SELECT t.id, t.title, a.name AS artist, al.name AS album, t.duration, t.file_path,
        t.provider, t.url, t.year, t.track_number, t.play_count, t.last_played,
-       t.liked, COALESCE(t.cover_art_path, al.cover_art_path) AS cover_art_path
+       t.liked, t.genre,
+       COALESCE(t.cover_art_path, al.cover_art_path) AS cover_art_path
 FROM tracks t
 LEFT JOIN artists a ON a.id = t.artist_id
 LEFT JOIN albums al ON al.id = t.album_id
