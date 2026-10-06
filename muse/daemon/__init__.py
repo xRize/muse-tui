@@ -1,0 +1,1 @@
+"""muse.daemon — background service: playback loop, IPC, media keys."""

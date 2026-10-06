@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muse"
+version = "0.1.0"
+description = "Linux-native terminal music client: daemon, CLI, TUI, Smart Shuffle, AutoMix."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "muse contributors" }]
+dependencies = [
+    "numpy>=1.26",
+    "sounddevice>=0.4.6",
+    "mutagen>=1.47",
+    "yt-dlp>=2024.10.22",
+    "textual>=0.80",
+    "rich>=13.7",
+    "requests>=2.31",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+macos = ["pyobjc-framework-MediaPlayer>=10.0"]
+linux = ["dbus-next>=0.2.3"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+muse = "muse.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["muse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
