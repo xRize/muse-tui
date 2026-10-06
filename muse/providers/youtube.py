@@ -2,11 +2,15 @@
 
 Search resolves to URLs; `muse get <url>` downloads with legal disclaimers and
 registers the file + tags in the library. Never bundles DRM circumvention.
+Downloads are titled `Artist - Song.mp3` (noise like "(Official Video)"
+stripped via yt-dlp metadata rewriting) and the search ranker prefers plain
+song/audio uploads over music videos.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +22,70 @@ TERMS_NOTICE = (
     "respect YouTube's Terms of Service and applicable copyright law. "
     "muse does not process DRM-protected streams."
 )
+
+# noise chunks such as "(Official Video)", "[4K]", "- Remastered 2011",
+# "(Lyric Video)" are stripped from titles before the dash split;
+# "Live" is intentionally kept (user preference).
+_BRACKET_RE = re.compile(r"[(\[][^\)\]]*[)\]]")
+_NOISE_RE = re.compile(
+    r"official|video|visualizer|remaster(?:ed)?(?:\s+\d{4})?|\blyrics?|"
+    r"\baudio\b|\bhd\b|\b4k\b|\bhq\b", re.I)
+_TAIL_NOISE_RE = re.compile(
+    r"\s+[-–—]\s+(?:(?:official|music|lyric[s]?|audio|hd|4k)\s+)*"
+    r"(?:video|lyrics?|audio|visualizer|remaster(?:ed)?(?:\s+\d{4})?)\s*$", re.I)
+_DASH_SPLIT_RE = re.compile(r"\s+[-–—]\s+")
+
+# search-result ranking: prefer the plain song/audio upload over videos
+_VIDEO_URL_RE = re.compile(r"(youtube\.com/watch\?.*|=|/)video|vevo", re.I)
+_LIVEISH_RE = re.compile(
+    r"\blive\b|acoustic|karaoke|tutorial|instrumental|reaction|\bcover\b|"
+    r"concert|session|remix|\bmix\b", re.I)
+
+
+def clean_meta(text: str) -> str:
+    """Strip YouTube noise from a title: bracketed chunks like "(Official
+    Video)" / "[4K]" and dash suffixes like " - Remastered 2011". Keeps
+    "(Live ...)" and "(feat. X)" (applied pre-split)."""
+    prev = None
+    while prev != text:
+        prev = text
+
+        def _drop_noisy_bracket(m: re.Match) -> str:
+            return "" if _NOISE_RE.search(m.group(0)) else m.group(0)
+
+        text = _BRACKET_RE.sub(_drop_noisy_bracket, text)
+        text = _TAIL_NOISE_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip(" -–—").strip()
+
+
+def split_title(raw: str) -> tuple[str, str]:
+    """Heuristic split of a YouTube/upload title into (artist, title).
+
+    YouTube Music and most uploads format titles as 'Artist - Song'; requires
+    a spaced dash so hyphenated words don't split. Unparseable titles return
+    ('', cleaned_title)."""
+    text = clean_meta(raw or "")
+    parts = _DASH_SPLIT_RE.split(text, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return "", text
+
+
+def _song_rank(entry: dict) -> int:
+    """Higher is a more song-like upload (audio/studio track over video)."""
+    raw = (entry.get("raw_title") or "").lower()
+    url = (entry.get("url") or "").lower()
+    score = 0
+    if _NOISE_RE.search(raw):
+        score -= 3  # titled like a video ("Official Music Video")
+    if _LIVEISH_RE.search(raw):
+        score -= 2  # live/karaoke/etc — downloadable, just ranked lower
+    if _VIDEO_URL_RE.search(url):
+        score -= 1
+    if _DASH_SPLIT_RE.search(raw):
+        score += 1  # "Artist - Song" shape: studio/Topic-channel convention
+    return score
 
 
 def _ytdlp() -> str | None:
@@ -74,14 +142,20 @@ class Provider:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            artist, title = split_title(entry.get("title") or "")
+            if not artist:
+                artist = entry.get("uploader") or entry.get("channel") or ""
             results.append({
-                "title": entry.get("title") or "",
-                "artist": entry.get("uploader") or entry.get("channel") or "",
+                "title": title,
+                "raw_title": entry.get("title") or "",
+                "artist": artist,
                 "duration": entry.get("duration") or 0,
                 "url": entry.get("url") or entry.get("webpage_url") or "",
                 "provider": "youtube",
             })
-        return results
+        # prefer song/audio uploads over music videos; ties keep yt-dlp's
+        # relevance order (score is stable-sorted, not reversed)
+        return sorted(results, key=_song_rank, reverse=True) if results else results
 
     AUDIO_EXTS = (".mp3", ".m4a", ".opus")
 
@@ -130,10 +204,41 @@ class Provider:
         dest_dir = Path(dest_dir).expanduser()
         dest_dir.mkdir(parents=True, exist_ok=True)
         known = {p.name for p in dest_dir.iterdir() if p.is_file()}
+        # filename uses the (noise-stripped) title only: the final
+        # "Artist - Song" rename for both mp3 + cover sidecar happens in
+        # register_downloaded_file, which can use real parsed metadata
+        # instead of yt-dlp's filename-template heuristics
+        # NOTE: --replace-in-metadata regexes can't carry nested/unbalanced
+        # parens across yt-dlp's arg validation: alternations stay flat and
+        # each '(...)' is escaped literally
         cmd = [exe, "--newline",
                "-o", str(dest_dir / "%(title)s.%(ext)s"),
                "-x", "--audio-format", "mp3",
-               "--embed-thumbnail", "--add-metadata"]
+               "--embed-thumbnail", "--add-metadata",
+               # thumbnail written alongside as a jpg by the same stem
+               "--convert-thumbnails", "jpg",
+               "--write-thumbnail",
+               # strip "(Official Video)"/"[4K]"/"- Lyric Video"-style noise
+               # from the title field before it becomes filename + tags
+               "--replace-in-metadata", "title",
+               r"\([Oo]fficial [Mm]usic [Vv]ideo\)|\([Oo]fficial [Vv]ideo\)"
+               r"|\([Oo]fficial [Aa]udio\)|\([Oo]fficial [Vv]isualizer\)"
+               r"|\([Ll]yric[s]? [Vv]ideo\)|\([Ll]yric[s]?\)|\([Aa]udio\)"
+               r"|\([Vv]isualizer\)|\([Cc]lip [Oo]fficial\)"
+               r"|\([Rr]emaster(ed)?( [0-9]{4})?\)"
+               r"|\[[Oo]fficial [Mm]usic [Vv]ideo\]|\[[Oo]fficial [Vv]ideo\]"
+               r"|\[[Ll]yric[s]? [Vv]ideo\]|\[4[Kk]\]|\[HD\]|\[HQ\]",
+               " ",
+               "--replace-in-metadata", "title",
+               r"\s*[-–—]\s*[Oo]fficial ([Mm]usic )?[Vv]ideo\s*$"
+               r"|\s*[-–—]\s*[Ll]yric[s]? [Vv]ideo\s*$"
+               r"|\s*[-–—]\s*[Vv]isualizer\s*$"
+               r"|\s*[-–—]\s*[Rr]emaster(ed)?( [0-9]{4})?\s*$",
+               " ",
+               # noise-strip leaves gaps behind ("Hymn For The Weekend  "):
+               # collapse runs of spaces, then trailing whitespace
+               "--replace-in-metadata", "title", r"\s{2,}", " ",
+               "--replace-in-metadata", "title", r"\s+$", " "]
         if extra_opts:
             cmd += extra_opts
         # URL(s) last (yt-dlp treats the first non-option as the target and
@@ -176,6 +281,10 @@ class Provider:
             if p.is_file() and p.name not in known
             and p.suffix.lower() in Provider.AUDIO_EXTS
         ]
+        thumbs: dict[str, Path] = {}
+        for p in dest_dir.iterdir():
+            if p.is_file() and p.name not in known and p.suffix.lower() == ".jpg":
+                thumbs[p.stem.lower()] = p
         files = new_files
         if not files and rc == 0:
             # postprocessed destinations (incl. "already downloaded" re-runs):
@@ -186,5 +295,21 @@ class Provider:
                     files.append(p)
                 elif (p.with_suffix(".mp3")).is_file():
                     files.append(p.with_suffix(".mp3"))
+        if not thumbs and rc == 0:
+            for p in dests:
+                twin = p.with_suffix(".jpg")
+                if twin.is_file():
+                    thumbs[p.with_suffix(".mp3").stem.lower()] = twin
         files = sorted(dict.fromkeys(files), key=lambda p: p.stat().st_mtime)
+        # a matching jpg (yt-dlp wrote the thumbnail) is treated as the track's
+        # cover art and renamed alongside the mp3 for register_downloaded_file
+        for f in files:
+            twin = thumbs.get(f.stem.lower())
+            if twin and twin.is_file():
+                cover = f.with_suffix(".jpg")
+                try:
+                    twin.replace(cover)
+                    log.debug("cover art saved alongside %s", f.name)
+                except OSError:
+                    pass
         return files, rc, tail

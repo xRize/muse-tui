@@ -31,6 +31,10 @@ def _safe_name(text: str) -> str:
 def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0,
                  offline: bool = False) -> dict:
     """LRCLIB lookup. Returns {'text': str, 'synced': bool, 'cached': bool} or text=''."""
+    # normalise YouTube-ish titles first ("Song (Official Video)" etc.)
+    from muse.providers.youtube import split_title
+    if not artist:
+        artist, title = split_title(f"{title}")
     key = hashlib.sha1(f"{artist}|{title}".lower().encode()).hexdigest()[:16]
     cache = paths.lyrics_dir() / f"{key}.json"
     if cache.exists():
@@ -42,17 +46,25 @@ def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0,
             pass
     if offline:
         return {"text": "", "synced": False, "cached": False}
-    try:
-        resp = requests.get(
-            "https://lrclib.net/api/get",
-            params={"artist_name": artist, "track_name": title,
-                    "album_name": album, "duration": duration},
-            headers=_UA, timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        log.info("lyrics fetch failed for %s - %s: %s", artist, title, e)
+    attempts = [(artist, title)]
+    if " - " in title:  # "Artist - Title" uploads: LRCLIB wants them separate
+        a2, t2 = title.split(" - ", 1)
+        attempts.append((a2.strip(), t2.strip()))
+    for a, t in attempts:
+        try:
+            resp = requests.get(
+                "https://lrclib.net/api/get",
+                params={"artist_name": a, "track_name": t,
+                        "album_name": album, "duration": duration},
+                headers=_UA, timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            log.info("lyrics fetch failed for %s - %s: %s", a, t, e)
+            data = None
+    if not data or not isinstance(data, dict):
         return {"text": "", "synced": False, "cached": False}
     result = {"text": data.get("plainLyrics") or "", "synced": bool(data.get("syncedLyrics"))}
     result["synced_text"] = data.get("syncedLyrics") or ""
@@ -62,13 +74,28 @@ def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0,
 
 # -- covers --------------------------------------------------------------------
 
-def fetch_cover(artist: str, album: str, offline: bool = False) -> str:
-    """Return path to a cached cover image (real art if network, else generated)."""
+def fetch_cover(artist: str, album: str, offline: bool = False,
+                thumb_url: str | None = None) -> str:
+    """Return path to a cached cover image (real art if network, else generated).
+
+    `thumb_url` (e.g. a YouTube thumbnail for a downloaded track) takes
+    priority — Deezer/album art is only consulted when there is no better
+    per-track image."""
     key = hashlib.sha1(f"{artist}|{album}".lower().encode()).hexdigest()[:16]
     cache = paths.covers_dir() / f"{key}.png"
     if cache.exists():
         return str(cache)
     if not offline:
+        if thumb_url:
+            try:
+                img = requests.get(thumb_url, headers=_UA, timeout=15,
+                                   allow_redirects=True)
+                img.raise_for_status()
+                cache.write_bytes(img.content)
+                return str(cache)
+            except Exception as e:
+                log.debug("thumbnail fetch fallback for %s/%s: %s",
+                          artist, album, e)
         # try Deezer open API (no key) -> album art URL
         try:
             resp = requests.get("https://api.deezer.com/search/album",

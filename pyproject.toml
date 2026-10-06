@@ -18,6 +18,8 @@ dependencies = [
     "textual>=0.80",
     "rich>=13.7",
     "requests>=2.31",
+    "pillow>=10.0",
+    "rich-pixels>=3.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

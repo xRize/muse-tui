@@ -22,6 +22,7 @@ from textual.widgets import (
 )
 
 from muse.daemon import ipc
+from muse.providers.youtube import _LIVEISH_RE, _NOISE_RE
 
 
 def _fmt(s: float | None) -> str:
@@ -62,7 +63,10 @@ class ResultItem(ListItem):
         url = result.get("url") or ""
         if url.startswith("https://www.youtube.com/watch?v=") and not result.get("is_playlist"):
             url = "yt:" + url.split("watch?v=", 1)[1]
-        super().__init__(Static(f"{title}  —  {artist}  [{dur}]  ({url})"))
+        raw = (result.get("raw_title") or title or "").lower()
+        noisy = _NOISE_RE.search(raw) or _LIVEISH_RE.search(raw)
+        tag = " video" if noisy else " song"
+        super().__init__(Static(f"{title}  —  {artist}  [{dur}]  ({url}){tag}"))
 
 
 class DownloadItem(ListItem):
@@ -92,6 +96,7 @@ class MuseTUI(App):
     Screen { layout: vertical; }
     #now-playing { dock: bottom; height: 7; padding: 0 1; border: round $accent;
                    background: $surface; }
+    #np-cover { width: 12; height: 5; margin-right: 2; }
     #progress { color: $accent; }
     ListView { border: round $primary; background: $surface; }
     #dl-results { height: 1fr; }
@@ -125,6 +130,8 @@ class MuseTUI(App):
         super().__init__()
         self._last_search = ""
         self._last_yt_query: str | None = None
+        self._cover_track_id = None
+        self._cover_failed = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -148,6 +155,7 @@ class MuseTUI(App):
                 yield Static("jobs", id="dl-jobs-header")
                 yield ListView(id="dl-jobs")
         with Static(id="now-playing"):
+            yield Static("", id="np-cover")
             yield Label("idle", id="np-title")
             yield Label("", id="progress")
             yield Label("", id="np-status")
@@ -365,6 +373,33 @@ class MuseTUI(App):
             f"Vol {st.get('volume', '?')}%  ·  AutoMix {'ON' if am.get('enabled') else 'OFF'}"
             f"  ·  state {st.get('state')}")
         self.sub_title = f"{st.get('state', 'idle')}"
+        self.refresh_cover(st)
+
+    def refresh_cover(self, st: dict) -> None:
+        """Now-playing album art (5-row half-block pixels, no-op on failure)."""
+        tid = st.get("id")
+        if tid == getattr(self, "_cover_track_id", object()) and not (
+                self._cover_failed):
+            return
+        self._cover_track_id = tid
+        self._cover_failed = False
+        widget = self.query_one("#np-cover", Static)
+        if not tid:
+            widget.update("")
+            return
+        try:
+            r = self._call("cover", {"ref": str(tid)})
+            path = r.get("cover") or ""
+            if not path:
+                widget.update("")
+                return
+            from PIL import Image
+            from rich_pixels import Pixels
+            img = Image.open(path).convert("RGB")
+            widget.update(Pixels.from_image(img, resize=(18, 9)))
+        except Exception:
+            self._cover_failed = True
+            widget.update("")
 
     def refresh_progress(self) -> None:
         st = self._call("status")

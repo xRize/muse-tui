@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tracks (
   play_count INTEGER NOT NULL DEFAULT 0,
   last_played REAL,
   liked INTEGER NOT NULL DEFAULT 0,
+  cover_art_path TEXT,
   UNIQUE(file_path)
 );
 CREATE TABLE IF NOT EXISTS playlists (
@@ -100,6 +101,8 @@ class Database:
         ):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE analysis ADD COLUMN {col} {decl}")
+        if "cover_art_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}:
+            self.conn.execute("ALTER TABLE tracks ADD COLUMN cover_art_path TEXT")
         for k, v in DEFAULTS.items():
             self.conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
         self.conn.commit()
@@ -181,19 +184,21 @@ class Database:
             self.conn.execute(
                 """UPDATE tracks SET title=?, artist_id=COALESCE(?, artist_id),
                    album_id=COALESCE(?, album_id), duration=COALESCE(?, duration),
-                   year=COALESCE(?, year), track_number=COALESCE(?, track_number)
+                   year=COALESCE(?, year), track_number=COALESCE(?, track_number),
+                   cover_art_path=COALESCE(?, cover_art_path)
                    WHERE id = ?""",
-                (title, artist_id, album_id, duration, year, track_number, existing["id"]),
+                (title, artist_id, album_id, duration, year, track_number,
+                 cover_art_path, existing["id"]),
             )
             track_id = existing["id"]
         else:
             cur = self.conn.execute(
                 """INSERT INTO tracks
                    (title, artist_id, album_id, duration, file_path, provider, url,
-                    year, track_number)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    year, track_number, cover_art_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (title, artist_id, album_id, duration, file_path, provider, url,
-                 year, track_number),
+                 year, track_number, cover_art_path),
             )
             track_id = cur.lastrowid
         if cover_art_path and album_id:
@@ -526,7 +531,7 @@ class Database:
 _TRACK_QUERY = """
 SELECT t.id, t.title, a.name AS artist, al.name AS album, t.duration, t.file_path,
        t.provider, t.url, t.year, t.track_number, t.play_count, t.last_played,
-       t.liked, al.cover_art_path
+       t.liked, COALESCE(t.cover_art_path, al.cover_art_path) AS cover_art_path
 FROM tracks t
 LEFT JOIN artists a ON a.id = t.artist_id
 LEFT JOIN albums al ON al.id = t.album_id

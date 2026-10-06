@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = mk("history", help="recently played")
     sp.add_argument("--limit", type=int, default=20)
 
-    sp = mk("get", help="download from YouTube via yt-dlp (url, yt:<id>, ytpl:<id>)")
+    sp = mk("get", help="download from YouTube via yt-dlp (url, yt:<id>, ytpl:<id>, search:<query>)")
     sp.add_argument("url")
     sp.add_argument("--playlist", action="store_true",
                     help="force playlist mode (whole list, not just one video)")
@@ -141,6 +141,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="parallel fragments per item (default 4)")
     sp.add_argument("--watch", action="store_true",
                     help="poll until no jobs are running, then return")
+    sp.add_argument("--name", action="store_true",
+                    help="show the resolved Artist — Song label for search refs")
+
+    sp = mk("ytsearch", help="top YouTube hits for a song query (ranked: songs first)")
+    sp.add_argument("query")
+    sp.add_argument("--limit", type=int, default=5)
 
     sp = mk("downloads", help="download job status (poll queue/results)")
 
@@ -244,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "workers": args.workers}, js)
         if _fail(resp):
             return 1
+        if args.name and args.url.startswith(("search:", "ytsearch:")):
+            print(f"resolved: {resp.get('label') or args.url}")
         if args.watch:
             resp = _cli_get_watch(js) or resp
         if js:
@@ -258,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif c == "downloads":
         resp = _call("downloads", {}, js)
+    elif c == "ytsearch":
+        resp = _call("ytsearch", {"query": args.query, "limit": args.limit}, js)
     elif c == "lyrics":
         resp = _call("lyrics", {"ref": args.ref}, js)
     elif c == "cover":
@@ -272,6 +282,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # already printed
     _print_human(c, resp, args)
     return 0
+
+
+def _looks_songish(raw_title: str) -> bool:
+    """Heuristic display tag: a title without video-noise words is a song."""
+    from muse.providers.youtube import _LIVEISH_RE, _NOISE_RE
+    raw = (raw_title or "").lower()
+    return not (_NOISE_RE.search(raw) or _LIVEISH_RE.search(raw))
 
 
 def _cli_get_watch(as_json: bool) -> dict:
@@ -386,6 +403,14 @@ def _print_human(c: str, resp: dict, args) -> None:
             elif j.get("track_ids"):
                 print(f"    imported track id(s): {', '.join(map(str, j['track_ids']))}")
         return
+    if c == "ytsearch":
+        for i, r in enumerate(resp.get("candidates", []), 1):
+            dur = _fmt_seconds(r.get("duration"))
+            kind = "song" if _looks_songish(r.get("raw_title") or "") else "video"
+            print(f"{i:3d}. {r.get('artist') or '?'} — {r.get('title')} "
+                  f"({dur}, youtube, {kind})")
+            print(f"      muse get {r.get('url')}")
+        return
     if c == "play":
         # compact
         for k in ("playing", "duration"):
@@ -404,7 +429,7 @@ def _print_completions(shell: str) -> int:
     cmds = ("play pause resume toggle stop next prev status stats seek queue "
             "shuffle search library import analyze playlist like unlike volume "
             "automix automix-preview radio discover history get downloads "
-            "lyrics cover daemon tui legal completions")
+            "ytsearch lyrics cover daemon tui legal completions")
     if shell == "bash":
         print(f"""# muse bash completion
 _muse_completions() {{

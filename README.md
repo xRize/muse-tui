@@ -82,30 +82,49 @@ muse completions fish  > ~/.config/fish/completions/muse.fish
 Download whole playlists or single videos from YouTube into the library —
 a YouTube-like flow in the terminal, built on yt-dlp.
 
+Files are named `Artist - Song.mp3`: noise like "(Official Video)", "[4K]",
+"- Remastered 2011" or "(Lyric Video)" is stripped from titles (kept:
+"(Live ...)", "(feat. ...)"), and the search ranker prefers plain song/audio
+uploads over music videos. Each download also grabs cover art (video
+thumbnail as a sidecar `.jpg` + embedded tags) and auto-fetches lyrics in the
+background.
+
 **TUI** (`muse tui`, tab 5 / Downloads tab):
 
 1. Paste a URL, `yt:<video-id>` or `ytpl:<playlist-id>` in the Downloads box
    and press Enter — the job starts immediately (`--playlist` force-flag not
    needed; `/playlist` URLs are detected automatically).
-2. Or type search terms — YouTube results populate the list; Enter downloads
+2. Or type search terms — the top 5 YouTube results populate the list
+   (song-shaped hits first, tagged ` song` vs ` video`); Enter downloads
    the highlighted hit (a YouTube "YouTube Music"-style flow).
 3. Jobs run in the daemon (survive TUI exit); the Jobs pane updates live with
    progress lines, imported track ids and real yt-dlp errors on failure.
-   Enter on a finished job plays the first imported track.
+   Enter on a finished job plays the first imported track. The now-playing
+   header shows cover art when the track has one.
 
 **CLI equivalents:**
 
 ```bash
 muse get "https://www.youtube.com/watch?v=…"      # single video (+ audio)
 muse get "ytpl:PLxx" --playlist --workers 8       # whole playlist
+muse get "search:coldplay hymn" --name            # resolve top-5 ranked hits,
+muse get "search:radiohead creep" --watch         # download the top hit
 muse get --watch "https://…"                      # poll until jobs finish
+muse ytsearch "radiohead creep"                   # show ranked top-5 candidates
+muse ytsearch "radiohead creep" --limit 3         # fewer/more candidates
 muse downloads                                    # job status/progress/errors
 ```
 
+`search:<query>` (also `ytsearch:<query>`) refs resolve inline to the top
+ranked result and queue it; `--name` prints the resolved `Artist — Song`
+label, `muse ytsearch` lists the ranked candidates with `song`/`video` tags
+and copy-pasteable `muse get <url>` hints.
+
 Completed downloads are auto-imported (tags via mutagen), queued for optional
 analysis by the normal tiered worker, and immediately playable/searchable.
-Downloads land in `download.path` (default `~/Music/muse`); override
-per-process with the `MUSE_DOWNLOAD_DIR` env var.
+Lyrics + cover art are fetched automatically right after import (best-effort,
+offline-safe). Downloads land in `download.path` (default `~/Music/muse`);
+override per-process with the `MUSE_DOWNLOAD_DIR` env var.
 
 Downloads always print the legal notice (see `muse legal`): for
 personal/archival use only — respect YouTube ToS and copyright; muse does not
@@ -123,9 +142,11 @@ muse/analysis   numpy DSP: onset autocorrelation BPM, KS-profile key,
                 R128-style loudness, beat grid, sections; tiered worker
                 vocals.py: Tier-2 vocal-region detection (quantile spectra)
 muse/smart      Smart Shuffle scorer + AutoMix transition planner
-muse/providers  local | youtube (yt-dlp downloader + playlist fetch)
+muse/providers  local | youtube (yt-dlp downloader + playlist fetch;
+                song-first search ranking + title cleanup)
                 | apple (MusicKit scaffold)
-                | lyrics (LRCLIB) | covers (Deezer -> generated fallback)
+                | lyrics (LRCLIB) | covers (video thumbs / Deezer ->
+                generated fallback)
 ```
 
 State: SQLite at `~/.local/share/muse/database.db`; config

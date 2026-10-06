@@ -13,6 +13,7 @@ from muse import db as dbmod
 from muse import paths
 from muse.analysis import worker as analysis_worker
 from muse.audio import playback as audio
+from muse.providers import media
 from muse.smart import automix as automix_mod
 from muse.smart import shuffle as shuffle_mod
 
@@ -318,6 +319,15 @@ class MuseCommands:
         results = [] if offline else prov.youtube.Provider().search(query, limit)
         return {"query": query, "offline": offline, "results": results}
 
+    def cmd_ytsearch(self, query: str, limit: int = 5) -> dict:
+        """Search-download: top YouTube hits for a song query as candidates.
+
+        Returns the ranked list (songs before videos): the caller passes one
+        to `yt_get`/`get` to actually download it. No library changes here."""
+        r = self.cmd_yt_search(query, limit=limit)
+        return {"query": query, "offline": r["offline"],
+                "candidates": r["results"]}
+
     def cmd_yt_available(self) -> dict:
         """yt-dlp presence probe (TUI uses it for 'install yt-dlp' hints)."""
         from muse.providers import youtube as yt
@@ -336,6 +346,14 @@ class MuseCommands:
         if not yt.available():
             return {"error": "yt-dlp not installed (pip install yt-dlp)"}
         raw = ref.strip()
+        if raw.startswith(("search:", "ytsearch:")):
+            # convenience: resolve the query inline (top hit) then download
+            hits = self.cmd_ytsearch(raw.split(":", 1)[1], limit=5)["candidates"]
+            if not hits:
+                return {"error": f"no YouTube results for {raw.split(':', 1)[1]!r}"}
+            raw = hits[0].get("url") or ""
+            if not raw:
+                return {"error": "top YouTube hit has no downloadable URL"}
         if raw.startswith("yt:"):
             url = "https://www.youtube.com/watch?v=" + raw[3:].strip()
         elif raw.startswith("ytpl:"):
@@ -345,11 +363,19 @@ class MuseCommands:
         else:
             url = "https://" + raw
         is_playlist = playlist or "/playlist" in url
-        jid = self._dl_job(url, "playlist" if is_playlist else "single")
+        from muse.providers.youtube import clean_meta, split_title
+        if is_playlist:
+            label = url
+        else:
+            artist, title = split_title(raw[3:].replace("+", " ")) \
+                if raw.startswith("yt:") else ("", "")
+            label = f"{artist} — {title}" if artist and title else clean_meta(
+                (raw[3:].replace("+", " ") if raw.startswith("yt:") else url))
+        jid = self._dl_job(label, "playlist" if is_playlist else "single")
         threading.Thread(target=self._dl_run, args=(jid, url, is_playlist, workers),
                          name=f"muse-dl-{jid}", daemon=True).start()
         return {"job": jid, "url": url, "kind": _DL_JOBS[jid]["kind"],
-                "notice": DOWNLOAD_NOTICE}
+                "label": label, "notice": DOWNLOAD_NOTICE}
 
     def _dl_run(self, jid: int, url: str, playlist: bool, workers: int) -> None:
         """Background worker: yt-dlp -> register files in the library."""
@@ -361,12 +387,12 @@ class MuseCommands:
 
         try:
             if playlist:
-                files, _rc, tail = yt.Provider.download_playlist(
+                files, rc, tail = yt.Provider.download_playlist(
                     url, dest, workers=workers, on_progress=prog)
             else:
                 file = yt.Provider.download(url, dest, on_progress=prog)
                 files = [file] if file else []
-                tail = ""
+                rc, tail = 0, ""
             track_ids = []
             for file in files:
                 tid = self.register_downloaded_file(file, url=url)
@@ -377,11 +403,34 @@ class MuseCommands:
                 track_ids=track_ids,
                 progress=f"{len(track_ids)} track(s) imported",
                 error=None if track_ids else
-                (f"yt-dlp exit {_rc}: {tail}" if tail else
+                (f"yt-dlp exit {rc}: {tail}" if tail else
                  "yt-dlp produced no audio files (see daemon log)"))
+            if track_ids:
+                threading.Thread(target=self._prewarm_extras,
+                                 args=(track_ids,), name=f"muse-prewarm-{jid}",
+                                 daemon=True).start()
         except Exception as e:
             log.exception("download job %s failed", jid)
             self._dl_update(jid, state="failed", error=str(e))
+
+    def _prewarm_extras(self, track_ids: list[int]) -> None:
+        """Fetch lyrics + cover art for fresh imports (best-effort, offline-safe)."""
+        db = self.db()
+        offline = paths.offline()
+        for tid in track_ids:
+            t = db.get_track(tid)
+            if not t:
+                continue
+            try:
+                if not offline:
+                    media.fetch_lyrics(t.get("artist") or "", t["title"],
+                                       t.get("album") or "",
+                                       int(t.get("duration") or 0),
+                                       offline=offline)
+                if not offline and not t.get("cover_art_path"):
+                    self.cmd_cover(str(tid))
+            except Exception as e:
+                log.debug("prewarm extras failed for track %s: %s", tid, e)
 
     def cmd_downloads(self) -> dict:
         """Queue/job overview for running + completed downloads."""
@@ -637,7 +686,8 @@ class MuseCommands:
         return {"downloaded": str(file), "track_id": track_id,
                 "notice": "for personal/archival use only — respect YouTube ToS and copyright"}
 
-    def register_downloaded_file(self, file: Path, url: str | None = None) -> int | None:
+    def register_downloaded_file(self, file: Path, url: str | None = None,
+                                 thumb_url: str | None = None) -> int | None:
         from mutagen import File as mutagen_file
         db = self.db()
         title = file.stem
@@ -651,6 +701,14 @@ class MuseCommands:
                 title = tags.get("TIT2").text[0] if tags.get("TIT2") else title
                 artist = tags.get("TPE1").text[0] if tags.get("TPE1") else None
                 album = tags.get("TALB").text[0] if tags.get("TALB") else None
+                # yt-dlp embeds the raw (pre-replace) title in TIT2 as a
+                # fallback tag; normalize it with the same cleaner so the
+                # final rename below sees the noise-free form
+                from muse.providers.youtube import clean_meta
+                if title:
+                    title = clean_meta(title)
+                if artist:
+                    artist = clean_meta(artist).strip() or None
             except Exception:
                 pass
         try:
@@ -659,6 +717,34 @@ class MuseCommands:
                 duration = audio_info.info.length
         except Exception:
             pass
+        # uploaded as "Artist - Song ..."-style filename without tags? split it
+        if not artist:
+            from muse.providers.youtube import split_title
+            artist, title2 = split_title(title)
+            if artist:
+                title = title2
+        # yt-dlp writes the full "Artist - Song" (noise-stripped) into TIT2
+        # while TPE1 carries the artist alone: strip the redundant prefix so
+        # titles/files don't become "Artist - Artist - Song"
+        if artist and title and title.lower().startswith(
+                f"{artist.lower()} - "):
+            title = title[len(artist) + 3:].strip()
+        # final filesystem name: "Artist - Song" (clean per muse naming);
+        # sidecar jpg (yt-dlp thumbnail) travels with the rename
+        if artist and title and file.stem != f"{artist} - {title}":
+            target = file.with_name(f"{artist} - {title}{file.suffix}")
+            try:
+                file.rename(target)
+                sidecar_src = file.with_suffix(".jpg")
+                if sidecar_src.is_file():
+                    sidecar_src.rename(target.with_suffix(".jpg"))
+                file = target
+            except OSError:
+                log.warning("could not rename %s to %s", file, target)
+        cover = None
+        sidecar = file.with_suffix(".jpg")
+        if sidecar.is_file():
+            cover = str(sidecar)
         path_str = str(file)
         if url:
             db.conn.execute(
@@ -667,7 +753,8 @@ class MuseCommands:
             db.conn.commit()
         return db.upsert_track(title=title, artist=artist, album=album,
                                duration=duration, file_path=path_str,
-                               provider="youtube", url=url)
+                               provider="youtube", url=url,
+                               cover_art_path=cover)
 
     def cmd_lyrics(self, ref: str | None = None) -> dict:
         db = self.db()
@@ -701,15 +788,18 @@ class MuseCommands:
         t = rows[0]
         if t.get("cover_art_path"):
             return {"cover": t["cover_art_path"], "cached": True}
-        path = None
-        from muse.providers.media import fetch_cover
-        path = fetch_cover(t.get("artist") or "", t.get("album") or "",
-                           offline=paths.offline())
+        # a YouTube-downloaded track's best art is its own video thumbnail
+        thumb = t.get("url") or ""
+        thumb_url = (f"https://i.ytimg.com/vi/{thumb.split('watch?v=', 1)[1]}"
+                     "/hqdefault.jpg") if "watch?v=" in thumb else None
+        path = media.fetch_cover(t.get("artist") or "", t.get("album") or "",
+                                 offline=paths.offline(), thumb_url=thumb_url)
         if path:
-            db.conn.execute("UPDATE albums SET cover_art_path=? WHERE id=?",
-                            (path, t["album_id"]))
+            db.conn.execute("UPDATE tracks SET cover_art_path=COALESCE(?, cover_art_path) WHERE id=?",
+                            (path, t["id"]))
             db.conn.commit()
-        return {"cover": path or "", "cached": False}
+            return {"cover": path, "cached": False}
+        return {"cover": "", "cached": False}
 
     # helper -----------------------------------------------------------------------
     def _probe_duration(self, path: str) -> float:
