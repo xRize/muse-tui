@@ -133,8 +133,16 @@ def main(argv: list[str] | None = None) -> int:
     sp = mk("history", help="recently played")
     sp.add_argument("--limit", type=int, default=20)
 
-    sp = mk("get", help="download from YouTube via yt-dlp")
+    sp = mk("get", help="download from YouTube via yt-dlp (url, yt:<id>, ytpl:<id>)")
     sp.add_argument("url")
+    sp.add_argument("--playlist", action="store_true",
+                    help="force playlist mode (whole list, not just one video)")
+    sp.add_argument("--workers", type=int, default=4,
+                    help="parallel fragments per item (default 4)")
+    sp.add_argument("--watch", action="store_true",
+                    help="poll until no jobs are running, then return")
+
+    sp = mk("downloads", help="download job status (poll queue/results)")
 
     sp = mk("lyrics")
     sp.add_argument("ref", nargs="?")
@@ -232,7 +240,24 @@ def main(argv: list[str] | None = None) -> int:
         resp = _call("radio", {"ref": args.ref, "length": args.length,
                                "enqueue": not args.no_enqueue}, js)
     elif c == "get":
-        resp = _call("get", {"url": args.url}, js)
+        resp = _call("yt_get", {"ref": args.url, "playlist": args.playlist,
+                                "workers": args.workers}, js)
+        if _fail(resp):
+            return 1
+        if args.watch:
+            resp = _cli_get_watch(js) or resp
+        if js:
+            print(json.dumps(resp, indent=2, default=str))
+            return 0
+        if args.watch and resp.get("jobs"):
+            _print_human("downloads", resp, args)
+        else:
+            print(f"download job #{resp.get('job')} queued ({resp.get('kind')}) — "
+                  "poll with: muse downloads")
+            print(resp.get("notice", ""))
+        return 0
+    elif c == "downloads":
+        resp = _call("downloads", {}, js)
     elif c == "lyrics":
         resp = _call("lyrics", {"ref": args.ref}, js)
     elif c == "cover":
@@ -247,6 +272,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # already printed
     _print_human(c, resp, args)
     return 0
+
+
+def _cli_get_watch(as_json: bool) -> dict:
+    """Poll `downloads` until no jobs are running; final snapshot is returned"""
+    last: dict = {}
+    try:
+        while True:
+            last = _call("downloads", {})
+            running = [j for j in last.get("jobs", []) if j.get("state") == "running"]
+            if not running:
+                break
+            for j in running:
+                p = j.get("progress") or ""
+                if p:
+                    print(f"  #{j['id']} {p}", flush=True)
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        print("(detached — job keeps running; check `muse downloads`)", flush=True)
+    return last
 
 
 def _print_human(c: str, resp: dict, args) -> None:
@@ -325,6 +369,23 @@ def _print_human(c: str, resp: dict, args) -> None:
         path = resp.get("cover")
         print(path or "(no cover)")
         return
+    if c == "downloads":
+        jobs = resp.get("jobs", [])
+        if not jobs:
+            print("no download jobs")
+            return
+        for j in jobs:
+            state = j.get("state", "?")
+            icon = {"running": "⏳", "done": "✓", "failed": "✗"}.get(state, "·")
+            line = f"{icon} #{j['id']} [{state}] {j.get('kind', '?')}: {j.get('label', '')}"
+            print(line)
+            if j.get("error"):
+                print(f"    error: {j['error']}")
+            elif j.get("progress") and state != "done":
+                print(f"    {j['progress']}")
+            elif j.get("track_ids"):
+                print(f"    imported track id(s): {', '.join(map(str, j['track_ids']))}")
+        return
     if c == "play":
         # compact
         for k in ("playing", "duration"):
@@ -342,18 +403,21 @@ def _print_completions(shell: str) -> int:
     list; per-argument values (track ids, playlist names) are not completed."""
     cmds = ("play pause resume toggle stop next prev status stats seek queue "
             "shuffle search library import analyze playlist like unlike volume "
-            "automix automix-preview radio discover history get lyrics cover "
-            "daemon tui legal completions")
+            "automix automix-preview radio discover history get downloads "
+            "lyrics cover daemon tui legal completions")
     if shell == "bash":
         print(f"""# muse bash completion
 _muse_completions() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
   case "${{COMP_WORDS[1]}}" in
     queue) COMPREPLY=( $(compgen -W "list add remove shuffle clear" -- "$cur") );;
+    get) COMPREPLY=( $(compgen -W "--playlist --workers --watch" -- "$cur") );;
     playlist) COMPREPLY=( $(compgen -W "list create delete add show play" -- "$cur") );;
     automix) COMPREPLY=( $(compgen -W "on off length config bandpass vocal" -- "$cur") );;
     daemon) COMPREPLY=( $(compgen -W "start stop status restart" -- "$cur") );;
     completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") );;
+    library) COMPREPLY=( $(compgen -W "--kind --artist --album" -- "$cur") );;
+    downloads) COMPREPLY=();;
     *)
       if [ "$COMP_CWORD" = 1 ]; then
         COMPREPLY=( $(compgen -W "{cmds}" -- "$cur") )

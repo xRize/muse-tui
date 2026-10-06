@@ -27,6 +27,13 @@ DOWNLOAD_NOTICE = (
     "YouTube ToS and copyright (see muse.legal)."
 )
 
+# YouTube download jobs: keyed by job id, shared by every registry in this
+# process (the daemon's shared registry + each direct-mode fallback registry
+# the CLI/TUI creates), so poll/download cycles stay consistent.
+_DL_JOBS: dict[int, dict] = {}
+_DL_LOCK = threading.Lock()
+_DL_NEXT = [0]
+
 
 class MuseCommands:
     def __init__(self, daemon=None):
@@ -281,6 +288,111 @@ class MuseCommands:
             tid = analysis_worker.import_file(db, p)
             return {"imported": 1, "track_ids": [tid]}
         return {"error": f"not found: {p}"}
+
+    # -- YouTube download interface (search -> queue -> poll -> library) ----------
+    # Jobs live at module level so direct-mode handle() calls (a fresh registry
+    # per request in CLI/TUI fallback) still see one job list across the
+    # search/get/downloads cycle; inside the daemon the shared registry uses
+    # the same store.
+
+    def _dl_job(self, label: str, kind: str) -> int:
+        with _DL_LOCK:
+            _DL_NEXT[0] += 1
+            jid = _DL_NEXT[0]
+            _DL_JOBS[jid] = {"id": jid, "label": label, "kind": kind,
+                             "state": "running", "progress": "", "error": None,
+                             "items": [], "track_ids": []}
+            return jid
+
+    @staticmethod
+    def _dl_update(jid: int, **fields) -> None:
+        with _DL_LOCK:
+            job = _DL_JOBS.get(jid)
+            if job:
+                job.update(fields)
+
+    def cmd_yt_search(self, query: str, limit: int = 10) -> dict:
+        """Search YouTube via yt-dlp --flat-playlist (offline: empty results)."""
+        from muse import providers as prov
+        offline = paths.offline()
+        results = [] if offline else prov.youtube.Provider().search(query, limit)
+        return {"query": query, "offline": offline, "results": results}
+
+    def cmd_yt_available(self) -> dict:
+        """yt-dlp presence probe (TUI uses it for 'install yt-dlp' hints)."""
+        from muse.providers import youtube as yt
+        return {"available": yt.available()}
+
+    def cmd_yt_get(self, ref: str, playlist: bool = False, workers: int = 4) -> dict:
+        """Queue a YouTube URL / id for a background audio download (yt-dlp).
+
+        Accepts full URLs, 'yt:<video-id>', 'ytpl:<playlist-id>' (or any
+        /playlist URL). Returns {'job': id, ...} — poll via `downloads`;
+        completed items are auto-imported into the library.
+        """
+        from muse.providers import youtube as yt
+        if paths.offline():
+            return {"error": "downloads disabled in MUSE_OFFLINE mode"}
+        if not yt.available():
+            return {"error": "yt-dlp not installed (pip install yt-dlp)"}
+        raw = ref.strip()
+        if raw.startswith("yt:"):
+            url = "https://www.youtube.com/watch?v=" + raw[3:].strip()
+        elif raw.startswith("ytpl:"):
+            url = "https://www.youtube.com/playlist?list=" + raw[5:].strip()
+        elif raw.startswith(("http://", "https://")):
+            url = raw
+        else:
+            url = "https://" + raw
+        is_playlist = playlist or "/playlist" in url
+        jid = self._dl_job(url, "playlist" if is_playlist else "single")
+        threading.Thread(target=self._dl_run, args=(jid, url, is_playlist, workers),
+                         name=f"muse-dl-{jid}", daemon=True).start()
+        return {"job": jid, "url": url, "kind": _DL_JOBS[jid]["kind"],
+                "notice": DOWNLOAD_NOTICE}
+
+    def _dl_run(self, jid: int, url: str, playlist: bool, workers: int) -> None:
+        """Background worker: yt-dlp -> register files in the library."""
+        from muse.providers import youtube as yt
+        dest = paths.download_dir()
+
+        def prog(line: str) -> None:
+            self._dl_update(jid, progress=line[-110:])
+
+        try:
+            if playlist:
+                files, _rc, tail = yt.Provider.download_playlist(
+                    url, dest, workers=workers, on_progress=prog)
+            else:
+                file = yt.Provider.download(url, dest, on_progress=prog)
+                files = [file] if file else []
+                tail = ""
+            track_ids = []
+            for file in files:
+                tid = self.register_downloaded_file(file, url=url)
+                if tid:
+                    track_ids.append(tid)
+            self._dl_update(
+                jid, state="done" if track_ids else "failed",
+                track_ids=track_ids,
+                progress=f"{len(track_ids)} track(s) imported",
+                error=None if track_ids else
+                (f"yt-dlp exit {_rc}: {tail}" if tail else
+                 "yt-dlp produced no audio files (see daemon log)"))
+        except Exception as e:
+            log.exception("download job %s failed", jid)
+            self._dl_update(jid, state="failed", error=str(e))
+
+    def cmd_downloads(self) -> dict:
+        """Queue/job overview for running + completed downloads."""
+        with _DL_LOCK:
+            jobs = [dict(j) for j in _DL_JOBS.values()]
+        jobs.sort(key=lambda j: j["id"], reverse=True)
+        return {"jobs": jobs}
+
+    def cmd_service_tick(self) -> dict:
+        """Manual tick (TUI direct mode has no daemon loop; harmless in-daemon)."""
+        return {"ticked": self.service_tick()}
 
     def cmd_analyze(self, track_id: int | None = None, all_pending: bool = False) -> dict:
         db = self.db()

@@ -52,6 +52,11 @@ def analysis_dir() -> Path:
 
 
 def download_dir() -> Path:
+    override = os.environ.get("MUSE_DOWNLOAD_DIR")
+    if override:
+        d = Path(override).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     from tomllib import TOMLDecodeError
     try:
         import tomllib

@@ -77,6 +77,40 @@ muse completions fish  > ~/.config/fish/completions/muse.fish
 
 `--json` on any command emits raw JSON for scripting.
 
+## Download interface (TUI + CLI)
+
+Download whole playlists or single videos from YouTube into the library —
+a YouTube-like flow in the terminal, built on yt-dlp.
+
+**TUI** (`muse tui`, tab 5 / Downloads tab):
+
+1. Paste a URL, `yt:<video-id>` or `ytpl:<playlist-id>` in the Downloads box
+   and press Enter — the job starts immediately (`--playlist` force-flag not
+   needed; `/playlist` URLs are detected automatically).
+2. Or type search terms — YouTube results populate the list; Enter downloads
+   the highlighted hit (a YouTube "YouTube Music"-style flow).
+3. Jobs run in the daemon (survive TUI exit); the Jobs pane updates live with
+   progress lines, imported track ids and real yt-dlp errors on failure.
+   Enter on a finished job plays the first imported track.
+
+**CLI equivalents:**
+
+```bash
+muse get "https://www.youtube.com/watch?v=…"      # single video (+ audio)
+muse get "ytpl:PLxx" --playlist --workers 8       # whole playlist
+muse get --watch "https://…"                      # poll until jobs finish
+muse downloads                                    # job status/progress/errors
+```
+
+Completed downloads are auto-imported (tags via mutagen), queued for optional
+analysis by the normal tiered worker, and immediately playable/searchable.
+Downloads land in `download.path` (default `~/Music/muse`); override
+per-process with the `MUSE_DOWNLOAD_DIR` env var.
+
+Downloads always print the legal notice (see `muse legal`): for
+personal/archival use only — respect YouTube ToS and copyright; muse does not
+process DRM-protected streams.
+
 ## Architecture
 
 ```
@@ -89,7 +123,8 @@ muse/analysis   numpy DSP: onset autocorrelation BPM, KS-profile key,
                 R128-style loudness, beat grid, sections; tiered worker
                 vocals.py: Tier-2 vocal-region detection (quantile spectra)
 muse/smart      Smart Shuffle scorer + AutoMix transition planner
-muse/providers  local | youtube (yt-dlp) | apple (MusicKit scaffold)
+muse/providers  local | youtube (yt-dlp downloader + playlist fetch)
+                | apple (MusicKit scaffold)
                 | lyrics (LRCLIB) | covers (Deezer -> generated fallback)
 ```
 
@@ -109,8 +144,9 @@ incoming track (avoiding mid-song lyrical collisions).
 
 ### TUI
 
-`muse tui` is a tabbed interface (Search / Queue / Library / Playlists) with a
-now-playing header, transport keys, and live status from the daemon.
+`muse tui` is a tabbed interface (Search / Queue / Library / Playlists /
+Downloads, keys 1–5) with a now-playing header, transport keys, and live
+status from the daemon.
 
 ## Offline / CI mode
 

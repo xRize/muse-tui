@@ -23,6 +23,7 @@ def tmp_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("MUSE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MUSE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("MUSE_TEST_DB", str(tmp_path / "db.sqlite"))
+    monkeypatch.setenv("MUSE_DOWNLOAD_DIR", str(tmp_path / "downloads"))
     return tmp_path
 
 

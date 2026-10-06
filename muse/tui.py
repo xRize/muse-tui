@@ -1,8 +1,9 @@
-"""muse TUI (Textual) — Search / Queue / Library / Playlists tabs + Now Playing.
+"""muse TUI (Textual) — Search / Queue / Library / Playlists / Downloads tabs.
 
 Wireframe (spec §4): tab bar, fuzzy search pane, scrollable track lists,
-progress bar; bottom controls with hotkeys. Falls back to in-process command
-handling when no daemon runs (same as the CLI).
+progress bar; bottom controls with hotkeys. The Downloads tab is a YouTube
+front-end (search hits + job queue + live progress) built on yt-dlp. Falls
+back to in-process command handling when no daemon runs (same as the CLI).
 """
 from __future__ import annotations
 
@@ -50,6 +51,41 @@ class PlaylistItem(ListItem):
         super().__init__(Static(f"{pl['name']}  ({pl.get('n_tracks', 0)} tracks {kind})"))
 
 
+class ResultItem(ListItem):
+    """A YouTube search hit (no local track id yet)."""
+
+    def __init__(self, result: dict):
+        self.result = result
+        dur = _fmt(result.get("duration"))
+        artist = result.get("artist") or "?"
+        title = result.get("title") or "?"
+        url = result.get("url") or ""
+        if url.startswith("https://www.youtube.com/watch?v=") and not result.get("is_playlist"):
+            url = "yt:" + url.split("watch?v=", 1)[1]
+        super().__init__(Static(f"{title}  —  {artist}  [{dur}]  ({url})"))
+
+
+class DownloadItem(ListItem):
+    """A download job row in the Downloads tab."""
+
+    def __init__(self, job: dict):
+        self.job = job
+        state = job.get("state", "?")
+        icon = {"running": "⏳", "done": "✓", "failed": "✗"}.get(state, "·")
+        label = job.get("label") or ""
+        extra = (job.get("error") or
+                 ("" if state == "done" else job.get("progress") or ""))
+        ids = job.get("track_ids") or []
+        if ids:
+            extra = f"imported: {', '.join(map(str, ids))}"
+        extra = f"  {extra}" if extra else ""
+        lines = [f"{icon} #{job['id']} [{state}] {job.get('kind', '?')}: "
+                 f"{label}{extra}"]
+        if state == "running" and job.get("progress"):
+            lines.append(f"   {job['progress']}")
+        super().__init__(Static("\n".join(lines)))
+
+
 class MuseTUI(App):
     TITLE = "muse"
     CSS = """
@@ -58,8 +94,12 @@ class MuseTUI(App):
                    background: $surface; }
     #progress { color: $accent; }
     ListView { border: round $primary; background: $surface; }
+    #dl-results { height: 1fr; }
+    #dl-jobs { height: 8; }
+    #dl-jobs-header { padding: 0 1; color: $text-muted; }
     Input { border: round $primary; }
     #search-info { padding: 0 1; color: $text-muted; }
+    #dl-info { padding: 0 1; color: $text-muted; }
     TabPane { padding: 0 1; }
     """
     BINDINGS = [
@@ -73,6 +113,7 @@ class MuseTUI(App):
         Binding("2", "tab('queue')", "Queue tab", show=False),
         Binding("3", "tab('library')", "Library tab", show=False),
         Binding("4", "tab('playlists')", "Playlists tab", show=False),
+        Binding("5", "tab('downloads')", "Downloads tab", show=False),
         Binding("s", "shuffle_queue", "Shuffle queue"),
         Binding("d", "discover", "Discover"),
         Binding("L", "lyrics", "Lyrics"),
@@ -83,6 +124,7 @@ class MuseTUI(App):
     def __init__(self):
         super().__init__()
         self._last_search = ""
+        self._last_yt_query: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -97,6 +139,14 @@ class MuseTUI(App):
                 yield ListView(id="library-list")
             with TabPane("Playlists", id="playlists"):
                 yield ListView(id="playlists-list")
+            with TabPane("Downloads", id="downloads"):
+                yield Input(placeholder="YouTube URL, 'yt:<id>' or search… "
+                                        "(Enter searches YouTube)",
+                            id="dl-box")
+                yield Label("", id="dl-info")
+                yield ListView(id="dl-results")
+                yield Static("jobs", id="dl-jobs-header")
+                yield ListView(id="dl-jobs")
         with Static(id="now-playing"):
             yield Label("idle", id="np-title")
             yield Label("", id="progress")
@@ -107,11 +157,13 @@ class MuseTUI(App):
         self.set_interval(2.0, self.refresh_status)
         self.set_interval(0.5, self.refresh_progress)
         self.set_interval(6.0, self.refresh_passive_lists)
+        self.set_interval(1.0, self.refresh_downloads)
         self.query_one("#search-box", Input).focus()
         self.refresh_status()
         self.refresh_queue()
         self.refresh_library()
         self.refresh_playlists()
+        self.refresh_downloads()
 
     # -- helpers ----------
     def _call(self, method: str, args: dict | None = None) -> dict:
@@ -182,6 +234,10 @@ class MuseTUI(App):
             q = event.value.strip()
             if q:
                 self.run_search(q)
+        elif event.input.id == "dl-box":
+            q = event.value.strip()
+            if q:
+                self.run_yt_search(q)
 
     def run_search(self, q: str) -> None:
         r = self._call("search", {"query": q, "provider": "local"})
@@ -194,9 +250,77 @@ class MuseTUI(App):
             lv.append(TrackItem(t, prefix=f"{i}. "))
         self._last_search = q
 
+    # -- downloads tab (YouTube search -> queue -> poll -> library) -----------
+    def run_yt_search(self, q: str) -> None:
+        """dl-box Enter: a URL/id queues a download directly; text searches
+        YouTube (yt-dlp) with Enter-to-download hits."""
+        if q.startswith(("http://", "https://", "yt:", "ytpl:")):
+            r = self._call("yt_get", {"ref": q, "playlist": "/playlist" in q})
+            info = self.query_one("#dl-info", Label)
+            if r.get("error"):
+                info.update(f"⚠ {r['error']}")
+                return
+            info.update(f"queued job #{r.get('job')} ({r.get('kind')}) — "
+                        "see Jobs below; notice: for personal/archival use only")
+            self._last_yt_query = None
+            self.refresh_downloads()
+            return
+        self._last_yt_query = q
+        r = self._call("yt_search", {"query": q})
+        lv = self.query_one("#dl-results", ListView)
+        lv.clear()
+        results = r.get("results", [])
+        if r.get("offline"):
+            self.query_one("#dl-info", Label).update(
+                "offline mode — YouTube search disabled (unset MUSE_OFFLINE)")
+            return
+        if not results:
+            yt_ok = self._call("yt_available").get("available", False)
+            self.query_one("#dl-info", Label).update(
+                f"no YouTube results for {q!r}" + ("" if yt_ok else
+                                                   " — is yt-dlp installed?"))
+            return
+        self.query_one("#dl-info", Label).update(
+            f"{len(results)} YouTube hit(s) for {q!r} — Enter downloads into "
+            "muse library")
+        for t in results:
+            lv.append(ResultItem(t))
+
+    def action_downloads_tab(self) -> None:
+        """Tab-5 binding: focus the dl-box."""
+        self.action_tab("downloads")
+        self.query_one("#dl-box", Input).focus()
+
+    def refresh_downloads(self) -> None:
+        """1s poller: job rows live-update (progress/imports/errors)."""
+        r = self._call("downloads")
+        jobs = r.get("jobs", [])
+        header = self.query_one("#dl-jobs-header", Static)
+        running = sum(1 for j in jobs if j.get("state") == "running")
+        header.update(
+            f"jobs ({running} running)" if running else
+            ("jobs (idle)" if jobs else "jobs — paste a YouTube URL above"))
+        lv = self.query_one("#dl-jobs", ListView)
+        sig = [(j.get("id"), j.get("state"),
+                (j.get("error") or j.get("progress") or "")[-40:])
+               for j in jobs]
+        if sig == getattr(self, "_last_dl_sig", None):
+            return
+        self._last_dl_sig = sig
+        keep = lv.highlighted_child
+        keep_idx = lv.index
+        lv.clear()
+        for j in jobs:
+            lv.append(DownloadItem(j))
+        if keep is not None and keep_idx is not None:
+            try:
+                lv.index = keep_idx
+            except Exception:
+                pass
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
-        if not isinstance(item, (TrackItem, PlaylistItem)):
+        if not isinstance(item, (TrackItem, PlaylistItem, ResultItem, DownloadItem)):
             return
         lv_id = event.list_view.id
         if isinstance(item, PlaylistItem):
@@ -208,6 +332,17 @@ class MuseTUI(App):
             for t in r.get("tracks", []):
                 results.append(TrackItem(t))
             self.action_tab("search")
+        elif isinstance(item, ResultItem):
+            # YouTube hit -> download into the library (job appears below)
+            self.query_one("#dl-info", Label).update(
+                f"queued download: {item.result.get('title')!r} — for personal/"
+                "archival use only, respect YouTube ToS and copyright")
+            self.run_yt_search(item.result.get("url") or item.result.get("id") or "")
+        elif isinstance(item, DownloadItem):
+            tid = (item.job.get("track_ids") or [None])[0]
+            if tid:
+                self._call("play", {"track_id": tid})
+                self.refresh_status()
         elif lv_id == "results":
             self._call("play", {"track_id": item.track["id"]})
             self.refresh_status()
