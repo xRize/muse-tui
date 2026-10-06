@@ -1,8 +1,11 @@
-"""Audio playback engine — sounddevice output fed by ffmpeg decoder threads.
+"""Audio playback engine — sounddevice output fed by ffmpeg decoder processes.
 
-Each Voice decodes its file to engine-rate stereo PCM in a worker thread and
-exposes sample-counted position and fade state. The Engine mixes active voices
-(prebuffered), handles end-of-stream / AutoMix handoff, volume and ReplayGain.
+Each Voice decodes its file to engine-rate stereo PCM from a long-running
+ffmpeg pipe (0.5s prebuffered at spawn so the first callback never blocks) and
+exposes sample-counted position and equal-power fade state. The Engine mixes
+active voices, handles end-of-stream / AutoMix handoff (rebuilding the
+incoming decoder at tempo 1.0 — the overlap-only `atempo` must not leak into
+the next track), volume and per-track ReplayGain.
 AutoMix overlaps optionally apply a band-limited filter (spec §3: low-pass the
 incoming track, open the mix back up at handoff) to mask frequency clashes.
 """
@@ -52,7 +55,8 @@ class DecodeProcess:
     """Long-running `ffmpeg` process decoding one file to f32le stereo PCM."""
 
     def __init__(self, path: str, sr: int = SR, gain: float = 0.0,
-                 tempo: float = 1.0, seek: float = 0.0):
+                 tempo: float = 1.0, seek: float = 0.0,
+                 prebuffer: float = 0.5):
         self.path = path
         self.gain = gain  # linear scalar
         self.tempo = tempo
@@ -69,19 +73,39 @@ class DecodeProcess:
             stdin=subprocess.DEVNULL,
         )
         self.gain = gain  # linear scalar
+        # Prime the pipe so the first callback read never blocks on a cold
+        # ffmpeg (spawn + header + filter init ≈ hundreds of ms -> underruns).
+        if prebuffer > 0:
+            self._prefill = self._read_raw(int(prebuffer * sr * CHANNELS * 4))
+        else:
+            self._prefill = b""
+
+    def _read_raw(self, nbytes: int) -> bytes:
+        """Blocking read of up to nbytes from the ffmpeg pipe."""
+        out = b""
+        while len(out) < nbytes:
+            chunk = self.proc.stdout.read(nbytes - len(out))
+            if not chunk:
+                break
+            out += chunk
+        return out
 
     def read(self, frames: int) -> np.ndarray:
         """Read exactly `frames` frames; shorter read = end of stream."""
         want = frames * CHANNELS * 4
-        buf = b""
-        while len(buf) < want:
-            chunk = self.proc.stdout.read(want - len(buf))
+        data = bytearray()
+        if self._prefill:
+            take = min(len(self._prefill), want - len(data))
+            data += self._prefill[:take]
+            self._prefill = self._prefill[take:]
+        while len(data) < want:
+            chunk = self.proc.stdout.read(want - len(data))
             if not chunk:
                 break
-            buf += chunk
-        data = np.frombuffer(buf, dtype=np.float32).copy()
-        n = len(data) // CHANNELS
-        return data[: n * CHANNELS].reshape(n, CHANNELS)
+            data += chunk
+        arr = np.frombuffer(bytes(data), dtype=np.float32).copy()
+        n = len(arr) // CHANNELS
+        return arr[: n * CHANNELS].reshape(n, CHANNELS)
 
     def close(self) -> None:
         try:
@@ -103,7 +127,7 @@ class DecodeProcess:
 class Voice:
     """One playing track: decoder + fade state + gain."""
 
-    def __init__(self, track_id: int, path: str, duration: float, gain: float = 0.0,
+    def __init__(self, track_id: int, path: str, duration: float, gain: float = 1.0,
                  tempo: float = 1.0, seek: float = 0.0,
                  band_filter: BandFilter | None = None):
         self.track_id = track_id
@@ -112,9 +136,10 @@ class Voice:
         self.seek = seek
         self.tempo = tempo
         self.decoder = DecodeProcess(path, SR, gain, tempo, seek)
+        self.gain = gain  # linear scalar applied in fill()
         self.samples_played = 0
         self.samples_decoded = 0
-        self.fade_start = None  # sample index where fade begins
+        self.fade_start = None  # played-sample index where fade begins
         self.fade_samples = 0
         self.fade_to = 0.0      # target scalar at fade end
         self.level = 1.0        # current scalar multiplier
@@ -133,19 +158,24 @@ class Voice:
         return max(0, int((self.duration - self.position_seconds) * SR))
 
     def start_fade(self, fade_seconds: float, to_level: float) -> None:
-        self.fade_start = self.samples_decoded
-        self.fade_samples = int(fade_seconds * SR)
+        """Fade `level -> to_level` over fade_seconds of played samples."""
+        self.fade_start = self.samples_played
+        self.fade_samples = max(1, int(fade_seconds * SR))
         self.fade_to = to_level
 
-    def end_fade(self, level: float = 1.0) -> None:
+    def end_fade(self, level: float | None = None) -> None:
         self.fade_start = None
-        self.level = level
+        if level is not None:
+            self.level = level
 
     def _current_level(self) -> float:
         if self.fade_start is None:
             return self.level
-        t = (self.samples_decoded - self.fade_start) / max(1, self.fade_samples)
-        return self.level + (self.fade_to - self.level) * min(1.0, max(0.0, t))
+        t = (self.samples_played - self.fade_start) / self.fade_samples
+        t = min(1.0, max(0.0, t))
+        # equal-power curve: -3dB at the crossover midpoint
+        lp = math.sin(t * math.pi / 2)
+        return self.level + (self.fade_to - self.level) * lp
 
     # -- fill ----------------------------------------------------------------
     def fill(self, out: np.ndarray, n: int) -> int:
@@ -166,13 +196,27 @@ class Voice:
         if total == 0:
             self.done = True
             return 0
-        level = self._current_level()
         if self.filter is not None:
             buf = self.filter.process(buf)
-        with self.lock:
-            self.level = level
-            self.samples_played += total
-        out[:total] += buf[:total] * level
+        if self.fade_start is not None:
+            fade_from_idx = self.fade_start
+            level_start = self.level
+            t0 = self.samples_played - fade_from_idx
+            t1 = t0 + total
+            ramp = [level_start + (self.fade_to - level_start)
+                    * math.sin(min(1.0, max(0.0, (k / self.fade_samples))) * math.pi / 2)
+                    for k in range(t0, t1)]
+            lvl = np.asarray(ramp, dtype=np.float32)[:, None]
+            with self.lock:
+                self.samples_played += total
+                if self.samples_played >= fade_from_idx + self.fade_samples:
+                    self.fade_start = None
+                    self.level = self.fade_to
+        else:
+            lvl = np.float32(self.level)
+            with self.lock:
+                self.samples_played += total
+        out[:total] += buf[:total] * lvl * self.gain
         return total
 
 
@@ -261,22 +305,29 @@ class Engine:
                 self.current.filter = BandFilter("highpass", 300.0)
                 incoming.filter = BandFilter("lowpass", 300.0)
             self.upcoming = incoming
+            incoming.level = 0.0  # fade-in must start from silence
             incoming.start_fade(fade_seconds, 1.0)
             return True
 
     def promote_upcoming(self) -> None:
         """Stop routing the incoming crossfade voice; its post-overlap tail
-        plays unmangled once promoted (filter removed, atempo reset)."""
+        plays unmangled once promoted (filter removed). The overlap-only
+        tempo scale is NOT reset here — the running decoder keeps its
+        `atempo` filter; handoff_if_ready rebuilds the decoder at tempo 1.0
+        when the outgoing track finishes."""
         with self._lock:
             nxt, self.upcoming = self.upcoming, None
             if nxt:
                 nxt.end_fade(level=1.0)
                 nxt.filter = None
                 self.current = nxt
-                nxt.decoder.tempo = 1.0  # only the overlap was tempo-scaled
 
     def handoff_if_ready(self) -> None:
-        """When outgoing finished, promote incoming. Clears handoff_done."""
+        """When outgoing finished, promote incoming. Clears handoff_done.
+
+        Also drops the overlap-only tempo scale: the incoming decoder was
+        started with an `atempo` filter so the transition kept A's beat; once
+        it owns the mix its decoder is rebuilt at tempo 1.0 (same seek phase)."""
         with self._lock:
             cur, nxt = self.current, self.upcoming
             if cur and cur.done and nxt:
@@ -285,6 +336,14 @@ class Engine:
                 if nxt.fade_start is not None:
                     nxt.end_fade(level=1.0)  # end fade at promoted level
                 nxt.filter = None           # unmangle at promotion
+                phase = nxt.position_seconds
+                if abs(nxt.tempo - 1.0) > 1e-6:
+                    nxt.decoder.close()
+                    nxt.decoder = DecodeProcess(nxt.path, SR, nxt.gain,
+                                                tempo=1.0, seek=phase,
+                                                prebuffer=0.5)
+                    nxt.tempo = 1.0
+                    nxt.seek = phase
                 cur.decoder.close()
                 self.handoff_done.set()
 

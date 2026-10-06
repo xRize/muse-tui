@@ -9,7 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from muse.audio.playback import BandFilter, Engine, Voice
+from muse.audio.playback import _BLOCK, SR, BandFilter, Engine, Voice
 from muse.daemon import commands as C
 
 
@@ -391,6 +391,88 @@ def test_engine_begin_crossfade_and_handoff(tmp_path):
     assert eng.current is v2 and eng.upcoming is None
     assert eng.handoff_done.is_set()
     assert v2.filter is None
+
+
+def test_crossfade_is_equal_power_both_ways(tmp_path):
+    """Regression (crackle report): the incoming voice must fade IN from
+    silence and the outgoing fade OUT — not slam in at full volume while the
+    'fade-out' starts at ~1.0 measured on samples_decoded."""
+    from muse.analysis.synth import click_track
+    p1 = click_track(str(tmp_path / "cfw.wav"), 120.0, bars=4)
+    p2 = click_track(str(tmp_path / "cfw2.wav"), 120.0, bars=4)
+    eng = Engine()
+    v1 = Voice(1, p1, 8.0)
+    v2 = Voice(2, p2, 8.0)
+    # loud constant decoders so level curves are directly measurable
+    v1.decoder = _LoudDecoder()
+    v2.decoder = _LoudDecoder()
+    eng.current = v1
+    eng.begin_crossfade(v2, 1.0)
+    assert v2.level == 0.0, "incoming must start silent"
+    assert abs(v1.fade_to) < 1e-9 and abs(v1.level - 1.0) < 1e-9
+    v2_in, v1_out, mixed = [], [], []
+    for _ in range(23):  # ~1.07s > 1s fade
+        o = np.zeros((_BLOCK, 2), dtype=np.float32)
+        v1.fill(o, _BLOCK)
+        v1_out.append(float(np.abs(o).max()))
+        o2 = np.zeros((_BLOCK, 2), dtype=np.float32)
+        v2.fill(o2, _BLOCK)
+        v2_in.append(float(np.abs(o2).max()))
+        mixed.append(float(np.abs(o + o2).max()))  # fill is additive
+    assert v1_out[0] > 0.2 > v1_out[-1], "outgoing fades toward silence"
+    assert v2_in[0] < 0.05 < v2_in[-1], "incoming fades up from silence"
+    assert v2.fade_start is None and v2.level == 1.0  # fade completed
+    # equal-power property: complementary sin ramps sum to 1, so the MIXED
+    # peak stays flat at the source level across the whole overlap
+    peak = max(mixed)
+    trough = min(mixed[1:-1])
+    assert 0.27 < peak < 0.33, peak
+    assert trough > 0.26, trough
+
+
+class _LoudDecoder:
+    """Constant loud PCM decoder stand-in for level-curve tests."""
+    def __init__(self, *a, **k):
+        pass
+    def read(self, frames):
+        return np.full((frames, 2), 0.3, dtype=np.float32)
+    def close(self):
+        pass
+    @property
+    def failed(self):
+        return False
+
+
+def test_handoff_resets_overlap_tempo(tmp_path):
+    """Regression: the overlap-only atempo scale must not leak into the whole
+    next track — handoff rebuilds the incoming decoder at tempo 1.0."""
+    from muse.analysis.synth import click_track
+    p1 = click_track(str(tmp_path / "t1.wav"), 120.0, bars=4)
+    p2 = click_track(str(tmp_path / "t2.wav"), 120.0, bars=4)
+    eng = Engine()
+    v1 = Voice(1, p1, 8.0)
+    v2 = Voice(2, p2, 8.0, tempo=1.02)  # tempo-scaled overlap decoder
+    eng.current = v1
+    eng.begin_crossfade(v2, 2.0)
+    assert abs(v2.tempo - 1.02) < 1e-9
+    v1.done = True
+    eng.handoff_if_ready()
+    assert abs(v2.tempo - 1.0) < 1e-9, "tempo scale must be dropped at handoff"
+    assert v2.decoder.tempo == 1.0
+    assert v2.filter is None
+
+
+def test_decoder_prebuffers_on_spawn(tmp_path):
+    """Regression (crackle report): a fresh decoder must have decoded PCM ready
+    before the audio callback first reads — no cold-pipe blocking. The Voice
+    constructor performs the prebuffer synchronously."""
+    from muse.analysis.synth import click_track
+    p = click_track(str(tmp_path / "pb.wav"), 120.0, bars=16)
+    v = Voice(1, p, 30.0)
+    assert len(v.decoder._prefill) >= int(0.4 * SR * 2 * 4), \
+        "at least ~0.4s of stereo f32 prebuffered"
+    first = v.decoder.read(_BLOCK)
+    assert first.shape[0] == _BLOCK  # served instantly from prefill
 
 
 def test_engine_seek_rebuilds_decoder(tmp_path):
