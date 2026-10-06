@@ -16,6 +16,20 @@ def reset_shared_registry():
     C._SHARED = None
 
 
+@pytest.fixture(autouse=True)
+def isolated_socket(monkeypatch):
+    """Never talk to a real daemon on the default socket: tests that skip
+    socket stubbing would otherwise reach the user's live daemon (real
+    downloads/DB writes). Every test gets its own dead socket path, so IPC
+    calls fall back to direct mode."""
+    import tempfile
+
+    from muse.daemon import ipc
+    monkeypatch.setattr(ipc, "socket_path",
+                        lambda: tempfile.gettempdir() + "/muse-test-dead.sock")
+    yield
+
+
 @pytest.fixture()
 def tmp_dirs(tmp_path, monkeypatch):
     """Redirect all muse XDG dirs + sqlite into the test's tmp_path."""

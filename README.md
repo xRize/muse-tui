@@ -202,7 +202,10 @@ incoming track (avoiding mid-song lyrical collisions).
 
 `muse tui` is a tabbed interface (Search / Queue / Library / Playlists /
 Downloads, keys 1–5) with a now-playing header, transport keys, and live
-status from the daemon.
+status from the daemon. In [kitty](https://sw.kovidgoyal.net/kitty/), the
+now-playing bar shows the current track's cover art as a real image (Kitty
+Graphics Protocol) beside the title/progress; every other terminal shows the
+same bar text-only.
 
 ## Offline / CI mode
 

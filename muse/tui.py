@@ -7,6 +7,8 @@ back to in-process command handling when no daemon runs (same as the CLI).
 """
 from __future__ import annotations
 
+import os
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import (
@@ -23,6 +25,28 @@ from textual.widgets import (
 
 from muse.daemon import ipc
 from muse.providers.youtube import _LIVEISH_RE, _NOISE_RE
+
+
+def _kitty_like() -> bool:
+    """True when the TUI runs in kitty (the only terminal we draw images in).
+
+    Kitty reports TERM=xterm-kitty (and TERM_PROGRAM=kitty); SSH hosts keep
+    the client's value, so forwarding through the socket is preserved."""
+    term = os.environ.get("TERM", "")
+    prog = os.environ.get("TERM_PROGRAM", "")
+    return term == "xterm-kitty" or "kitty" in term.lower() \
+        or "kitty" in prog.lower()
+
+
+# Cover-art widget class, decided once before Textual owns the terminal (the
+# textual_image import probes terminal capabilities over stdin/stdout; doing
+# that mid-TUI would corrupt the event stream). None -> no art at all.
+_cover_widget_class = None
+if _kitty_like():
+    try:
+        from textual_image.widget import TGPImage as _cover_widget_class
+    except Exception:  # textual-image not importable: no art, text unaffected
+        _cover_widget_class = None
 
 
 def _fmt(s: float | None) -> str:
@@ -98,8 +122,9 @@ class MuseTUI(App):
     CSS = """
     Screen { layout: vertical; }
     #now-playing { dock: bottom; height: 7; padding: 0 1; border: round $accent;
-                   background: $surface; }
-    #np-cover { width: 12; height: 5; margin-right: 2; }
+                   background: $surface; layout: horizontal; align-vertical: middle; }
+    #np-cover { width: 12; height: 5; margin-right: 2; align-vertical: middle; }
+    #np-text { width: 1fr; }
     #progress { color: $accent; }
     ListView { border: round $primary; background: $surface; }
     #dl-results { height: 1fr; }
@@ -161,10 +186,12 @@ class MuseTUI(App):
                 yield Static("jobs", id="dl-jobs-header")
                 yield ListView(id="dl-jobs")
         with Static(id="now-playing"):
-            yield Static("", id="np-cover")
-            yield Label("idle", id="np-title")
-            yield Label("", id="progress")
-            yield Label("", id="np-status")
+            if _cover_widget_class is not None:
+                yield _cover_widget_class(None, id="np-cover")
+            with Static(id="np-text"):
+                yield Label("idle", id="np-title")
+                yield Label("", id="progress")
+                yield Label("", id="np-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -400,30 +427,28 @@ class MuseTUI(App):
         self.refresh_cover(st)
 
     def refresh_cover(self, st: dict) -> None:
-        """Now-playing album art (5-row half-block pixels, no-op on failure)."""
+        """Now-playing album art (kitty TGP image only, no-op elsewhere)."""
         tid = st.get("id")
         if tid == getattr(self, "_cover_track_id", object()) and not (
                 self._cover_failed):
             return
         self._cover_track_id = tid
         self._cover_failed = False
-        widget = self.query_one("#np-cover", Static)
+        if _cover_widget_class is None:  # not kitty: text-only layout
+            return
+        widget = self.query_one("#np-cover")
         if not tid:
-            widget.update("")
+            widget.image = None
             return
         try:
             r = self._call("cover", {"ref": str(tid)})
             path = r.get("cover") or ""
             if not path:
-                widget.update("")
+                widget.image = None
                 return
-            from PIL import Image
-            from rich_pixels import Pixels
-            img = Image.open(path).convert("RGB")
-            widget.update(Pixels.from_image(img, resize=(18, 9)))
+            widget.image = path
         except Exception:
             self._cover_failed = True
-            widget.update("")
 
     def refresh_progress(self) -> None:
         st = self._call("status")
