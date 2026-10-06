@@ -27,10 +27,13 @@ _BLOCK = 2048  # frames per callback tick
 
 
 class BandFilter:
-    """Streaming one-pole low/high-pass, applied in exact block form.
+    """Streaming one-pole low/high-pass, exact per-sample block form.
 
-    y[n] = y[n-1] + a*(x[n]-y[n-1]) carried across callback blocks via the
-    analytic continuation ((1-a)^N * carry + convolution of the block); used
+    Unrolls y[m] = (1-a)·y[m-1] + a·x[m] from the previous block's final
+    sample C: the carry decays per sample ((1-a)^(m+1)·C) and the forced
+    input folds into one zero-padded FFT convolution. The earlier uniform
+    `(1-a)^n·C` continuation stepped the state discontinuously at every
+    block boundary — periodic clicks for the whole AutoMix overlap. Used
     during AutoMix crossfades (highpass 'out', lowpass 'in')."""
     def __init__(self, kind: str, hz: float, sr: int = SR):
         self.kind = kind  # "lowpass" | "highpass"
@@ -41,14 +44,19 @@ class BandFilter:
         n = block.shape[0]
         if n == 0:
             return block
-        h = self.alpha * (1.0 - self.alpha) ** np.arange(n)
+        a, decay = self.alpha, 1.0 - self.alpha
+        x = block.astype(np.float64)
+        # kernel h[0]=0, h[j]=a·decay^(j-1): conv[m+1] = Σ_k a·decay^(m-k)·x[k]
+        h = np.zeros(2 * n)
+        h[1:] = a * decay ** np.arange(0, 2 * n - 1)
         conv = np.fft.irfft(
-            np.fft.rfft(block, 2 * n, axis=0) * np.fft.rfft(h, 2 * n)[:, None],
-            n=2 * n, axis=0)[:n]
-        lp = (1.0 - self.alpha) ** n * self._carry + conv
-        out = lp if self.kind == "lowpass" else block - lp
+            np.fft.rfft(x, 2 * n, axis=0) * np.fft.rfft(h)[:, None],
+            n=2 * n, axis=0)
+        m = np.arange(n)
+        lp = decay ** (m + 1)[:, None] * self._carry + conv[1:n + 1]
         self._carry = lp[-1].copy()
-        return out
+        lp32 = lp.astype(block.dtype)
+        return lp32 if self.kind == "lowpass" else (block - lp32)
 
 
 class DecodeProcess:
@@ -72,6 +80,7 @@ class DecodeProcess:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
         )
+        self.samples_returned = 0   # content samples handed out (pre/pipe)
         self.gain = gain  # linear scalar
         # Prime the pipe so the first callback read never blocks on a cold
         # ffmpeg (spawn + header + filter init ≈ hundreds of ms -> underruns).
@@ -105,6 +114,7 @@ class DecodeProcess:
             data += chunk
         arr = np.frombuffer(bytes(data), dtype=np.float32).copy()
         n = len(arr) // CHANNELS
+        self.samples_returned += n
         return arr[: n * CHANNELS].reshape(n, CHANNELS)
 
     def close(self) -> None:
@@ -234,6 +244,9 @@ class Engine:
         self.start_paused = start_paused
         self.paused = start_paused
         self.handoff_done = threading.Event()   # set when automix handoff completes
+        # (cur, nxt) parked by handoff_if_ready; finish_pending_handoff() does
+        # the expensive decoder work — never inside the audio callback.
+        self.pending_handoff: tuple[Voice, Voice] | None = None
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -322,30 +335,61 @@ class Engine:
                 nxt.filter = None
                 self.current = nxt
 
-    def handoff_if_ready(self) -> None:
-        """When outgoing finished, promote incoming. Clears handoff_done.
+    def handoff_if_ready(self) -> bool:
+        """When the outgoing track finished, swap in the incoming voice.
 
-        Also drops the overlap-only tempo scale: the incoming decoder was
-        started with an `atempo` filter so the transition kept A's beat; once
-        it owns the mix its decoder is rebuilt at tempo 1.0 (same seek phase)."""
+        Callback-safe: only a state swap, no decoder/proc work here. Expensive
+        parts — closing the outgoing ffmpeg (proc.wait up to 2s) and rebuilding
+        the incoming decoder to drop the overlap `atempo` (spawn + prefill) —
+        are parked in `pending_handoff` for a non-callback thread (see
+        `finish_pending_handoff`).
+        """
         with self._lock:
             cur, nxt = self.current, self.upcoming
-            if cur and cur.done and nxt:
-                self.current = nxt
-                self.upcoming = None
-                if nxt.fade_start is not None:
-                    nxt.end_fade(level=1.0)  # end fade at promoted level
-                nxt.filter = None           # unmangle at promotion
-                phase = nxt.position_seconds
-                if abs(nxt.tempo - 1.0) > 1e-6:
-                    nxt.decoder.close()
-                    nxt.decoder = DecodeProcess(nxt.path, SR, nxt.gain,
-                                                tempo=1.0, seek=phase,
-                                                prebuffer=0.5)
-                    nxt.tempo = 1.0
-                    nxt.seek = phase
-                cur.decoder.close()
-                self.handoff_done.set()
+            if not (cur and cur.done and nxt):
+                return False
+            self.current = nxt
+            self.upcoming = None
+            if nxt.fade_start is not None:
+                nxt.end_fade(level=1.0)    # end fade at the promoted level
+            nxt.filter = None              # unmangle at promotion
+            self.pending_handoff = (cur, nxt)
+            self.handoff_done.set()
+            return True
+
+    def finish_pending_handoff(self) -> None:
+        """Complete a `handoff_if_ready` swap off the audio callback: close the
+        outgoing decoder and rebuild the incoming one at tempo 1.0 (the overlap
+        `atempo` must not leak into the rest of the next track).
+
+        The incoming decoder kept decoding during the overlap, so rebuild at
+        its CONTENT phase = samples_returned / tempo / SR — not
+        `position_seconds`, which double-counts the overlap once this voice
+        is `current`. The voice's output counter restarts (samples_played=0,
+        seek=phase) so position_seconds = phase + new-output/SR stays true
+        file-time at the new tempo 1.0. Called every service tick; a no-op
+        without a swap."""
+        job = self.pending_handoff
+        if not job:
+            return
+        cur, nxt = job
+        with self._lock:
+            if self.current is not nxt:    # a new track took over meanwhile
+                self.pending_handoff = None
+                return
+            phase = nxt.decoder.samples_returned / \
+                (nxt.tempo if abs(nxt.tempo - 1.0) > 1e-6 else 1.0) / SR
+            if abs(nxt.tempo - 1.0) > 1e-6:
+                nxt.decoder.close()
+                nxt.decoder = DecodeProcess(nxt.path, SR, nxt.gain,
+                                            tempo=1.0, seek=phase,
+                                            prebuffer=0.5)
+                nxt.tempo = 1.0
+            nxt.samples_played = 0   # restart output clock at the new seek
+            nxt.samples_decoded = 0
+            nxt.seek = phase
+            cur.decoder.close()
+            self.pending_handoff = None
 
     # -- seek ---------------------------------------------------------------------
     def seek(self, seconds: float) -> float:
@@ -393,11 +437,13 @@ class Engine:
         with self._lock:
             cur, nxt = self.current, self.upcoming
             if cur:
-                cur.fill(out, frames)
-                if nxt and not cur.done:
-                    nxt.fill(out, frames)
+                if not cur.done:
+                    cur.fill(out, frames)
+                if nxt:
+                    nxt.fill(out, frames)   # keep mixing even cur is done —
+                    # zero dead-air gap between cur's eof and the swap
                 out *= self.master
-                if cur.done or cur.failed:
+                if cur.done and nxt:        # state swap only — no decoder work
                     self.handoff_if_ready()
 
     # -- controls -----------------------------------------------------------------

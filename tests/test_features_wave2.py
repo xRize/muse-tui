@@ -356,19 +356,21 @@ def test_band_filter_highpass_gains():
 
 def test_band_filter_carry_continuity():
     """Splitting a signal into two blocks must match single-block processing
-    (streaming carry is exact)."""
+    (the per-sample carry continuation is exact — a regression here sounds as
+    a periodic click at every block boundary for the whole overlap)."""
     sr = 44100
     rng = np.random.default_rng(5)
     x = rng.standard_normal((4096, 2)).astype(np.float32)
+    prime = rng.standard_normal((512, 2)).astype(np.float32)  # ONE shared history
     f = BandFilter("lowpass", 300.0, sr)
-    f.process(rng.standard_normal((512, 2)).astype(np.float32))  # prime the carry
-    whole = f.process(x.copy())                          # carry carried through
+    f.process(prime.copy())
+    whole = f.process(x.copy())
     f2 = BandFilter("lowpass", 300.0, sr)
-    f2.process(rng.standard_normal((512, 2)).astype(np.float32))  # same prime
+    f2.process(prime.copy())
     a = f2.process(x[:1024].copy())
     b = f2.process(x[1024:].copy())
     split = np.vstack([a, b])
-    assert np.abs(whole - split).max() < 0.3, np.abs(whole - split).max()
+    assert np.abs(whole - split).max() < 1e-3, np.abs(whole - split).max()
 
 
 # -- engine crossfade / handoff / promote --------------------------------------------
@@ -385,8 +387,37 @@ def test_engine_begin_crossfade_and_handoff(tmp_path):
     assert eng.upcoming is v2
     assert v1.fade_start is not None
     assert eng.upcoming.fade_start is not None
-    # simulate outgoing completion
-    v1.done = True
+    # no dead air at the handoff boundary: the tick where cur flips done must
+    # still mix the incoming voice (old code skipped nxt.fill on that tick)
+    class _EofAfterOne:
+        def __init__(self):
+            self.calls = 0
+        def read(self, frames):
+            self.calls += 1
+            if self.calls > 1:
+                return np.zeros((0, 2), np.float32)
+            return np.full((frames, 2), 0.3, np.float32)
+        def close(self):
+            pass
+        failed = False
+
+    v1.decoder = _EofAfterOne()
+    v2.decoder = _LoudDecoder()  # click files start with silence — use loud PCM
+    # fade v2 partway in first (level rising), then v1 hits eof
+    for _ in range(8):
+        o = np.zeros((_BLOCK, 2), dtype=np.float32)
+        v1.fill(o, _BLOCK)
+        v2.fill(o, _BLOCK)
+    assert v1.done, "eof decoder must finish v1"
+    # now v1 is done; several callback ticks must STILL mix v2 (dead-air check)
+    done_peaks = []
+    for _ in range(3):
+        o2 = np.zeros((_BLOCK, 2), dtype=np.float32)
+        with eng._lock:
+            eng._cb(o2, _BLOCK, None, 0)   # engine mixes current-only now
+        done_peaks.append(float(np.abs(o2).max()))
+    assert all(p > 0.02 for p in done_peaks), \
+        f"dead air after cur.done: {done_peaks}"
     eng.handoff_if_ready()
     assert eng.current is v2 and eng.upcoming is None
     assert eng.handoff_done.is_set()
@@ -445,7 +476,9 @@ class _LoudDecoder:
 
 def test_handoff_resets_overlap_tempo(tmp_path):
     """Regression: the overlap-only atempo scale must not leak into the whole
-    next track — handoff rebuilds the incoming decoder at tempo 1.0."""
+    next track — handoff rebuilds the incoming decoder at tempo 1.0. The
+    rebuild is DEFERRED out of the audio callback: handoff_if_ready only
+    swaps state and parks (cur, nxt); finish_pending_handoff does the work."""
     from muse.analysis.synth import click_track
     p1 = click_track(str(tmp_path / "t1.wav"), 120.0, bars=4)
     p2 = click_track(str(tmp_path / "t2.wav"), 120.0, bars=4)
@@ -455,11 +488,32 @@ def test_handoff_resets_overlap_tempo(tmp_path):
     eng.current = v1
     eng.begin_crossfade(v2, 2.0)
     assert abs(v2.tempo - 1.02) < 1e-9
+    # let the overlap decode some seconds so the phase check is meaningful
+    for _ in range(10):
+        o = np.zeros((_BLOCK, 2), dtype=np.float32)
+        v1.fill(o, _BLOCK)
+        v2.fill(o, _BLOCK)
+    decoded_before = v2.decoder.samples_returned
+    assert decoded_before > 0
     v1.done = True
     eng.handoff_if_ready()
+    assert eng.current is v2 and eng.upcoming is None
+    assert eng.handoff_done.is_set()
+    assert eng.pending_handoff == (v1, v2), "work parked, not done in callback"
+    assert abs(v2.tempo - 1.02) < 1e-9, "tempo unchanged until finish_pending_handoff"
+    eng.finish_pending_handoff()
+    assert eng.pending_handoff is None
     assert abs(v2.tempo - 1.0) < 1e-9, "tempo scale must be dropped at handoff"
     assert v2.decoder.tempo == 1.0
     assert v2.filter is None
+    # timeline must continue seamlessly: voice clock restarts at the decoded
+    # content phase (position_seconds == phase right after the restart)
+    phase = decoded_before / 1.02 / SR
+    assert abs(v2.seek - phase) < 0.01
+    assert abs(v2.position_seconds - phase) < 0.01
+    # a second finish call is a clean no-op
+    eng.finish_pending_handoff()
+    assert abs(v2.tempo - 1.0) < 1e-9
 
 
 def test_decoder_prebuffers_on_spawn(tmp_path):

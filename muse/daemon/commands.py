@@ -843,7 +843,12 @@ class MuseCommands:
         Returns a small dict describing what happened (for tests/logs), else None.
         """
         eng = self.engine
-        if eng is None or self.database is None or eng.paused:
+        if eng is None or eng.paused:
+            return None
+        # complete any parked handoff off the audio callback (decoder rebuild
+        # @ tempo 1.0 + closing the outgoing ffmpeg — must not block _cb)
+        eng.finish_pending_handoff()
+        if self.database is None:
             return None
         if eng.needs_advance():
             return self._advance_after_end()
