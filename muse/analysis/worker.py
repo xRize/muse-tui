@@ -136,7 +136,9 @@ def run_analysis(database: dbmod.Database, track_id: int, tiers: int = 2) -> boo
     track = database.get_track(track_id)
     if not track or not track.get("file_path"):
         return False
-    path = track["file_path"].replace("~", str(Path.home()))
+    # expanduser, not a global "~" replace: literal tildes inside file names
+    # (e.g. "Pearl Jam ~~ Black ♥.mp3") must survive untouched
+    path = str(Path(track["file_path"]).expanduser())
     if not Path(path).is_file():
         return False
     try:
@@ -176,18 +178,52 @@ def run_analysis(database: dbmod.Database, track_id: int, tiers: int = 2) -> boo
     return True
 
 
-def analyze_pending(database: dbmod.Database, tiers: int = 2, limit: int = 50) -> list[int]:
-    """Analyze up to `limit` tracks missing analysis.
+def analyze_ids(database: dbmod.Database, ids: list[int | None], tiers: int = 2) -> list[int]:
+    """Analyze a specific set of tracks, skipping ones already fully analyzed.
 
-    Missing files are pruned first: without this, dead rows occupy the
-    pending batch head but fail `run_analysis` invisibly, and once 50+ such
-    rows exist `analyze --all` can never reach any live pending track."""
-    database.prune_missing_files()
+    Import is idempotent, so it can return rows that already carry analysis;
+    re-importing must not re-analyze (wasted minutes on big libraries)."""
     done = []
-    for tid in database.pending_analysis(tiers=tiers, limit=limit):
+    for tid in ids:
+        if tid is None or database.has_analysis(tid, tiers):
+            continue
         if run_analysis(database, tid, tiers=tiers):
             done.append(tid)
     return done
+
+
+def analyze_pending(database: dbmod.Database, tiers: int = 2,
+                    limit: int | None = None, batch: int = 50) -> list[int]:
+    """Analyze tracks missing analysis, batching until the pending list is
+    exhausted (limit=None — `all_pending` now really means all).
+
+    Missing files are pruned first: without this, dead rows occupy the
+    pending batch head but fail `run_analysis` invisibly, and once 50+ such
+    rows exist `analyze --all` can never reach any live pending track.
+
+    A track whose analysis fails permanently (corrupt/undecodable audio is
+    saved with tiers_done=0) still matches the pending query forever, so
+    failures are remembered and skipped; when a batch makes no progress the
+    walk stops instead of spinning."""
+    database.prune_missing_files()
+    done: list[int] = []
+    doomed: set[int] = set()
+    while True:
+        pending = [tid for tid in database.pending_analysis(tiers=tiers, limit=batch)
+                   if tid not in doomed]
+        if not pending:
+            return done
+        progressed = False
+        for tid in pending:
+            if run_analysis(database, tid, tiers=tiers):
+                done.append(tid)
+                progressed = True
+            else:
+                doomed.add(tid)
+        if limit and len(done) >= limit:
+            return done[:limit]
+        if not progressed:
+            return done
 
 
 def ensure_analysis(database: dbmod.Database, track_id: int, tiers: int = 1) -> dict | None:

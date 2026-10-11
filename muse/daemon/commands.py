@@ -90,7 +90,9 @@ class MuseCommands:
         if lufs and lufs > -60:
             delta_db = min(9.0, max(-9.0, -16.0 - lufs))
             gain = 10 ** (delta_db / 20)
-        path = t["file_path"].replace("~", str(Path.home()))
+        # expanduser, not a global "~" replace: literal tildes inside file
+        # names (e.g. "Pearl Jam ~~ Black ♥.mp3") must survive untouched
+        path = str(Path(t["file_path"]).expanduser())
         duration = t.get("duration") or ainfo.get("duration") or 0
         if not duration:
             duration = self._probe_duration(path)
@@ -272,16 +274,91 @@ class MuseCommands:
         rows = rows[offset:]
         return {"tracks": rows}
 
-    def cmd_import(self, path: str) -> dict:
+    def cmd_import(self, path: str, analyze: bool = False) -> dict:
         p = Path(path).expanduser()
         db = self.db()
+        # snapshot before importing: 'imported' keeps the legacy meaning (rows
+        # touched); 'new' counts only tracks that did not exist before —
+        # re-importing a directory would otherwise report the same counts
+        # forever, which is useless information.
+        before = set(db.all_track_ids())
         if p.is_dir():
-            ids = analysis_worker.import_directory(db, p)
-            return {"imported": len(ids), "track_ids": ids}
-        if p.is_file():
+            ids = [t for t in analysis_worker.import_directory(db, p) if t]
+        elif p.is_file():
             tid = analysis_worker.import_file(db, p)
-            return {"imported": 1, "track_ids": [tid]}
-        return {"error": f"not found: {p}"}
+            ids = [tid] if tid else []
+        else:
+            return {"error": f"not found: {p}"}
+        out: dict = {"imported": len(ids), "track_ids": ids,
+                     "new": len([i for i in ids if i not in before])}
+        if analyze and ids:
+            already = sum(1 for i in ids if db.has_analysis(i, 2))
+            done = analysis_worker.analyze_ids(db, ids)
+            out["analyzed"] = len(done)
+            out["failed"] = len(ids) - already - len(done)
+            out["details"] = self._analysis_details(db, done)
+        return out
+
+    def cmd_scan(self, path: str | None = None, analyze: bool = True) -> dict:
+        """Scan for music: prune dead rows, import new files, drain analysis.
+
+        With a path, imports everything found under it (recursive, idempotent).
+        Without one, the scan roots come from config ([library] scan_paths)
+        plus the download dir; the managed library copy dir itself is skipped
+        (re-importing copies onto themselves is pure IO waste). Analysis then
+        drains every pending track, so a scan also repairs libraries that were
+        imported but never analyzed."""
+        db = self.db()
+        out: dict = {"pruned": len(db.prune_missing_files()), "new": 0}
+        before = set(db.all_track_ids())
+        if path:
+            p = Path(path).expanduser()
+            if p.is_file():
+                tid = analysis_worker.import_file(db, p)
+                out["imported"] = 1 if tid else 0
+            elif p.is_dir():
+                out["imported"] = len([t for t in analysis_worker.import_directory(db, p) if t])
+            else:
+                return {"error": f"not found: {p}"}
+        else:
+            from muse import paths as muse_paths
+            library_dir = muse_paths.library_dir().resolve()
+            roots: list[Path] = [muse_paths.download_dir()]
+            cfg = muse_paths.read_config().get("library", {}).get("scan_paths", [])
+            if isinstance(cfg, str):
+                cfg = [cfg]
+            for raw in cfg:
+                roots.append(Path(str(raw)).expanduser())
+            seen: set[Path] = set()
+            imported = 0
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                resolved = root.resolve()
+                if resolved == library_dir or resolved in seen:
+                    continue
+                seen.add(resolved)
+                imported += len([t for t in analysis_worker.import_directory(db, root) if t])
+            out["imported"] = imported
+            out["roots"] = [str(r) for r in seen]
+        out["new"] = len([i for i in db.all_track_ids() if i not in before])
+        if analyze:
+            done = analysis_worker.analyze_pending(db)
+            out["analyzed"] = len(done)
+            out["details"] = self._analysis_details(db, done)
+        return out
+
+    @staticmethod
+    def _analysis_details(db: dbmod.Database, ids: list[int]) -> list[dict]:
+        """Compact per-track BPM/key rows for human output after analysis."""
+        rows = []
+        for tid in ids:
+            t = db.get_track(tid) or {}
+            a = db.get_analysis(tid) or {}
+            rows.append({"track_id": tid, "artist": t.get("artist"),
+                         "title": t.get("title"),
+                         "bpm": a.get("bpm") or None, "key": a.get("key") or None})
+        return rows
 
     # -- YouTube download interface (search -> queue -> poll -> library) ----------
     # Jobs live at module level so direct-mode handle() calls (a fresh registry
@@ -436,10 +513,11 @@ class MuseCommands:
         """Manual tick (TUI direct mode has no daemon loop; harmless in-daemon)."""
         return {"ticked": self.service_tick()}
 
-    def cmd_analyze(self, track_id: int | None = None, all_pending: bool = False) -> dict:
+    def cmd_analyze(self, track_id: int | None = None, all_pending: bool = False,
+                    limit: int | None = None) -> dict:
         db = self.db()
         if all_pending:
-            done = analysis_worker.analyze_pending(db)
+            done = analysis_worker.analyze_pending(db, limit=limit)
             return {"analyzed": done}
         if track_id is None:
             eng = self.engine
@@ -913,7 +991,7 @@ class MuseCommands:
             t = db.get_track(tid)
             if not t or not t.get("file_path"):
                 return None
-            path = t["file_path"].replace("~", str(Path.home()))
+            path = str(Path(t["file_path"]).expanduser())
             if not Path(path).is_file():
                 return None
             duration = t.get("duration") or 0

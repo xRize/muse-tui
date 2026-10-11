@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "muse"
 version = "0.1.0"
-description = "Linux-native terminal music client: daemon, CLI, TUI, Smart Shuffle, AutoMix."
+description = "Terminal-first music client for macOS & Linux: daemon, CLI, TUI, Smart Shuffle, AutoMix."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

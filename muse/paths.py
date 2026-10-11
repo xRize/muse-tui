@@ -104,6 +104,9 @@ replaygain = "album"   # "track" | "album" | "off"
 path = "~/Music/muse"
 yt_dlp_opts = ["--extract-audio", "--audio-format", "mp3"]
 
+[library]
+scan_paths = []          # extra dirs `muse scan` sweeps (plus the download dir)
+
 [automix]
 enabled = true
 transition_length = 8  # seconds

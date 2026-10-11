@@ -249,7 +249,9 @@ class Database:
         rows = self.conn.execute(
             "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL").fetchall()
         for r in rows:
-            p = Path(str(r["file_path"]).replace("~", str(Path.home())))
+            # expanduser() only rewrites a LEADING tilde — a global "~" replace
+            # mangles names containing literal "~" and then wrongly prunes them
+            p = Path(str(r["file_path"])).expanduser()
             if not p.is_file():
                 gone.append(r["id"])
         for tid in gone:

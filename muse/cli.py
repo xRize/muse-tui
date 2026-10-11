@@ -15,11 +15,19 @@ from pathlib import Path
 from muse import __version__
 from muse.daemon import ipc
 
+# import/scan decode+analyze whole files one per track; a big directory can
+# run for minutes, so the IPC wait is raised well past the 10s request default
+_LONG_IPC_TIMEOUT = 1800.0
+
 
 def _call(method: str, args: dict | None = None, as_json: bool = False,
-          direct: bool = False):
-    """Call daemon over IPC; fall back to in-process handling when absent."""
-    resp = ipc.request(method, args or {})
+          direct: bool = False, timeout: float | None = None):
+    """Call daemon over IPC; fall back to in-process handling when absent.
+
+    Long-running calls (import/scan/analyze) pass a generous timeout — the
+    IPC client defaults to 10s, which a big-library import blows past."""
+    kw = {"timeout": timeout} if timeout is not None else {}
+    resp = ipc.request(method, args or {}, **kw)
     if not resp.get("ok") and "daemon not running" in str(resp.get("error", "")):
         from muse.daemon.commands import handle
         resp = handle(method, args or {})
@@ -93,10 +101,22 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = mk("import", help="add audio file/directory to library")
     sp.add_argument("path")
+    sp.add_argument("--analyze", action="store_true",
+                    help="run BPM/key/LUFS analysis on imported tracks right away")
+
+    sp = mk("scan", help="find music: prune dead rows, import new files, "
+                         "analyze everything pending")
+    sp.add_argument("path", nargs="?",
+                    help="audio file/folder to scan (default: download dir + "
+                         "[library] scan_paths from config)")
+    sp.add_argument("--no-analyze", action="store_true",
+                    help="skip analysis (import only)")
 
     sp = mk("analyze", help="run offline analysis")
     sp.add_argument("ref", nargs="?", help="track id (default: all pending)")
     sp.add_argument("--all", action="store_true")
+    sp.add_argument("--limit", type=int, default=None,
+                    help="cap analyzed track count (with --all)")
 
     sp = mk("playlist", help="list/create/delete/add/show")
     sp.add_argument("action", default="list")
@@ -217,10 +237,16 @@ def main(argv: list[str] | None = None) -> int:
         resp = _call("library", {"artist": args.artist, "album": args.album,
                                  "kind": getattr(args, "kind", None)}, js)
     elif c == "import":
-        resp = _call("import", {"path": args.path}, js)
+        resp = _call("import", {"path": args.path, "analyze": args.analyze}, js,
+                     timeout=_LONG_IPC_TIMEOUT)
+    elif c == "scan":
+        resp = _call("scan", {"path": args.path, "analyze": not args.no_analyze},
+                     js, timeout=_LONG_IPC_TIMEOUT)
     elif c == "analyze":
         resp = _call("analyze", {"all_pending": args.all,
-                                 "track_id": int(args.ref) if args.ref and args.ref.isdigit() else None}, js)
+                                 "track_id": int(args.ref) if args.ref and args.ref.isdigit() else None,
+                                 "limit": args.limit}, js,
+                     timeout=_LONG_IPC_TIMEOUT if args.all else None)
     elif c == "playlist":
         resp = _call("playlist", {"action": args.action, "name": args.name,
                                   "ref": args.ref}, js)
@@ -320,11 +346,57 @@ def _cli_get_watch(as_json: bool) -> dict:
     return last
 
 
+def _print_analysis_details(details: list | None, cap: int = 20) -> None:
+    """Per-track BPM/key rows after import --analyze / scan / analyze --all."""
+    details = details or []
+    for d in details[:cap]:
+        bpm = d.get("bpm")
+        bpm_s = f"BPM {bpm:g}" if isinstance(bpm, (int, float)) and bpm else "BPM ?"
+        artist = d.get("artist") or "?"
+        title = d.get("title") or "?"
+        print(f"   {artist} — {title}  ({bpm_s}, key {d.get('key') or '?'})")
+    if len(details) > cap:
+        print(f"   … and {len(details) - cap} more")
+
+
 def _print_human(c: str, resp: dict, args) -> None:
     if c == "status":
         for k in ("state", "title", "artist", "position", "duration", "volume"):
             if k in resp:
                 print(f"{k}: {resp[k]}")
+        return
+    if c == "import":
+        shown = resp.get("imported", 0)
+        line = f"imported {shown} track(s) from {args.path}"
+        new = resp.get("new")
+        if new is not None and shown and new < shown:
+            line += f" ({shown - new} already in library)"
+        print(line)
+        if resp.get("failed"):
+            print(f"   ({resp['failed']} not decodable — skipped analysis)")
+        _print_analysis_details(resp.get("details"))
+        return
+    if c == "scan":
+        parts = [f"pruned {resp.get('pruned', 0)} dead row(s)"]
+        if "imported" in resp:
+            ipart = f"processed {resp.get('imported', 0)} file(s)"
+            if resp.get("new") is not None:
+                ipart += f", {resp['new']} new"
+            parts.append(ipart)
+        if "analyzed" in resp:
+            parts.append(f"analyzed {resp.get('analyzed', 0)}")
+        print(" · ".join(parts))
+        if resp.get("roots") and not getattr(args, "path", None):
+            print("roots: " + ", ".join(resp["roots"]))
+        _print_analysis_details(resp.get("details"))
+        return
+    if c == "analyze":
+        if isinstance(resp.get("analyzed"), list):
+            print(f"analyzed {len(resp['analyzed'])} track(s)"
+                  if resp["analyzed"] else "nothing pending — library fully analyzed")
+        else:
+            print(f"track {resp.get('track_id')}: "
+                  f"{resp.get('analysis_summary') or ('ok' if resp.get('success') else 'failed')}")
         return
     if c == "search":
         for i, r in enumerate(resp.get("results", []), 1):
@@ -450,7 +522,7 @@ def _print_completions(shell: str) -> int:
     """Print a completion script (spec §4: shell-completion). Static command
     list; per-argument values (track ids, playlist names) are not completed."""
     cmds = ("play pause resume toggle stop next prev status stats seek queue "
-            "shuffle search library import analyze playlist like unlike volume "
+            "shuffle search library import scan analyze playlist like unlike volume "
             "automix automix-preview radio genq discover history get downloads "
             "ytsearch lyrics cover daemon tui legal completions")
     if shell == "bash":
@@ -533,6 +605,7 @@ def _daemon(action: str, as_json: bool) -> int:
             print("daemon already running")
             return 0
         import subprocess as _sp
+
         import muse as _muse_pkg
         # `python -m` puts the CWD first on sys.path, while the editable
         # install is a meta-path finder — so a directory that merely CONTAINS
