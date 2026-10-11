@@ -18,6 +18,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    RichLog,
     Static,
     TabbedContent,
     TabPane,
@@ -69,14 +70,15 @@ class TrackItem(ListItem):
         if genre:
             meta += f"  · {genre}"
         label = f"{prefix}{title}  —  {artist}  [{dur}] ({provider}){meta}"
-        super().__init__(Static(label))
+        super().__init__(Static(label, markup=False))
 
 
 class PlaylistItem(ListItem):
     def __init__(self, pl: dict):
         self.playlist = pl
         kind = "smart" if pl.get("is_smart") else ""
-        super().__init__(Static(f"{pl['name']}  ({pl.get('n_tracks', 0)} tracks {kind})"))
+        super().__init__(Static(
+            f"{pl['name']}  ({pl.get('n_tracks', 0)} tracks {kind})", markup=False))
 
 
 class ResultItem(ListItem):
@@ -93,7 +95,8 @@ class ResultItem(ListItem):
         raw = (result.get("raw_title") or title or "").lower()
         noisy = _NOISE_RE.search(raw) or _LIVEISH_RE.search(raw)
         tag = " video" if noisy else " song"
-        super().__init__(Static(f"{title}  —  {artist}  [{dur}]  ({url}){tag}"))
+        super().__init__(Static(
+            f"{title}  —  {artist}  [{dur}]  ({url}){tag}", markup=False))
 
 
 class DownloadItem(ListItem):
@@ -114,26 +117,98 @@ class DownloadItem(ListItem):
                  f"{label}{extra}"]
         if state == "running" and job.get("progress"):
             lines.append(f"   {job['progress']}")
-        super().__init__(Static("\n".join(lines)))
+        super().__init__(Static("\n".join(lines), markup=False))
 
 
 class MuseTUI(App):
     TITLE = "muse"
+    SUB_TITLE = "your local radio"
     CSS = """
-    Screen { layout: vertical; }
-    #now-playing { dock: bottom; height: 7; padding: 0 1; border: round $accent;
-                   background: $surface; layout: horizontal; align-vertical: middle; }
+    Screen { layout: vertical; background: $background; }
+
+    #now-playing {
+        dock: bottom; height: 7; padding: 0 2;
+        border: round $accent; background: $panel;
+        layout: horizontal; align-vertical: middle;
+    }
     #np-cover { width: 12; height: 5; margin-right: 2; align-vertical: middle; }
-    #np-text { width: 1fr; }
+    #np-text { width: 1fr; padding: 0 1; }
+    #np-title { text-style: bold; }
+    #np-status { color: $text-muted; }
     #progress { color: $accent; }
+
+    Tabs { background: $panel; }
+    Tabs Tab.-active { color: $accent; text-style: bold; }
+    TabPane { padding: 1 2; }
+
     ListView { border: round $primary; background: $surface; }
+    ListView:focus { border: round $accent; }
+    ListItem { padding: 0 1; }
+
+    Input { border: round $primary; background: $surface; }
+    Input:focus { border: round $accent; }
+
+    #search-info, #dl-info, #queue-info {
+        padding: 0 1; color: $text-muted;
+    }
+
     #dl-results { height: 1fr; }
     #dl-jobs { height: 8; }
-    #dl-jobs-header { padding: 0 1; color: $text-muted; }
-    Input { border: round $primary; }
-    #search-info { padding: 0 1; color: $text-muted; }
-    #dl-info { padding: 0 1; color: $text-muted; }
-    TabPane { padding: 0 1; }
+    #dl-jobs-header { padding: 1 1 0 1; color: $text-muted; text-style: bold; }
+
+    Footer { background: $panel; border-top: heavy $primary; }
+
+    #fullscreen-panel {
+        display: none;
+        dock: top;
+        width: 100%;
+        height: 100%;
+        layout: horizontal;
+        background: $background;
+        layer: above;
+    }
+    #fs-left {
+        width: 50%;
+        height: 100%;
+        layout: vertical;
+        align: center middle;
+        padding: 1 2;
+    }
+    #fs-cover {
+        width: auto;
+        height: auto;
+        max-height: 20;
+        margin-bottom: 1;
+    }
+    #fs-title-text {
+        width: 90%;
+        background: $surface;
+        border: round $accent;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #fs-status-text {
+        width: 90%;
+        color: $text-muted;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #fs-lyrics-pane {
+        width: 50%;
+        height: 100%;
+        layout: vertical;
+        padding: 1 2;
+    }
+    #fs-lyrics {
+        height: 1fr;
+        border: round $primary;
+    }
+    #fs-hint {
+        height: auto;
+        text-align: center;
+        color: $text-muted;
+    }
     """
     BINDINGS = [
         Binding("space", "toggle", "Play/Pause"),
@@ -146,32 +221,36 @@ class MuseTUI(App):
         Binding("2", "tab('queue')", "Queue tab", show=False),
         Binding("3", "tab('library')", "Library tab", show=False),
         Binding("4", "tab('playlists')", "Playlists tab", show=False),
-        Binding("5", "tab('downloads')", "Downloads tab", show=False),
+        Binding("5", "downloads_tab", "Downloads tab", show=False),
         Binding("s", "shuffle_queue", "Shuffle queue"),
         Binding("g", "genq", "Generate Queue"),
         Binding("d", "discover", "Discover"),
-        Binding("L", "lyrics", "Lyrics"),
+        Binding("L", "lyrics", "Lyrics", key_display="Shift+L"),
+        Binding("F", "toggle_panel", "Fullscreen", key_display="Shift+F"),
+        Binding("Q", "queue_selected", "Queue highlighted", key_display="Shift+Q"),
         Binding("a", "automix_toggle", "AutoMix"),
         Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self):
         super().__init__()
+        self.theme = "tokyo-night"
         self._last_search = ""
         self._last_yt_query: str | None = None
         self._cover_track_id = None
         self._cover_failed = False
+        self._panel_visible = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(initial="search", id="tabs"):
             with TabPane("Search", id="search"):
                 yield Input(placeholder="Search library… (Enter to search)", id="search-box")
-                yield Label("", id="search-info")
+                yield Label("", id="search-info", markup=False)
                 yield ListView(id="results")
             with TabPane("Queue", id="queue"):
-                yield Label("Enter removes a track; G generates a similar queue",
-                            id="queue-info")
+                yield Label("Enter removes a track · g generates a similar queue",
+                            id="queue-info", markup=False)
                 yield ListView(id="queue-list")
             with TabPane("Library", id="library"):
                 yield ListView(id="library-list")
@@ -181,18 +260,30 @@ class MuseTUI(App):
                 yield Input(placeholder="YouTube URL, 'yt:<id>' or search… "
                                         "(Enter searches YouTube)",
                             id="dl-box")
-                yield Label("", id="dl-info")
+                yield Label("", id="dl-info", markup=False)
                 yield ListView(id="dl-results")
-                yield Static("jobs", id="dl-jobs-header")
+                yield Static("jobs", id="dl-jobs-header", markup=False)
                 yield ListView(id="dl-jobs")
         with Static(id="now-playing"):
             if _cover_widget_class is not None:
                 yield _cover_widget_class(None, id="np-cover")
             with Static(id="np-text"):
-                yield Label("idle", id="np-title")
-                yield Label("", id="progress")
-                yield Label("", id="np-status")
+                yield Label("idle", id="np-title", markup=False)
+                yield Label("", id="progress", markup=False)
+                yield Label("", id="np-status", markup=False)
         yield Footer()
+        # -- fullscreen lyrics panel --
+        with Static(id="fullscreen-panel"):
+            with Static(id="fs-left"):
+                if _cover_widget_class is not None:
+                    yield _cover_widget_class(None, id="fs-cover")
+                yield Label("", id="fs-title-text", markup=False)
+                yield Label("", id="fs-status-text", markup=False)
+            with Static(id="fs-lyrics-pane"):
+                yield RichLog(id="fs-lyrics", wrap=True,
+                              highlight=False, markup=False, max_lines=5000)
+                yield Label("Shift+F: close · scroll arrows move lyrics",
+                            id="fs-hint", markup=False)
 
     def on_mount(self) -> None:
         self.set_interval(2.0, self.refresh_status)
@@ -200,6 +291,8 @@ class MuseTUI(App):
         self.set_interval(6.0, self.refresh_passive_lists)
         self.set_interval(1.0, self.refresh_downloads)
         self.query_one("#search-box", Input).focus()
+        self.query_one("#now-playing").border_title = " now playing "
+        self.query_one("#results", ListView).border_title = " search results "
         self.refresh_status()
         self.refresh_queue()
         self.refresh_library()
@@ -282,6 +375,94 @@ class MuseTUI(App):
             lv.append(TrackItem(t))
         self.action_tab("search")
 
+    def action_queue_selected(self) -> None:
+        """Shift+Q: queue the highlighted track (Search results or Library)."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        active = tabs.active
+        if active not in ("search", "library"):
+            self.query_one("#queue-info", Label).update(
+                "Shift+Q queues from the Search or Library tab")
+            self.action_tab("queue")
+            return
+        lv_id = "#results" if active == "search" else "#library-list"
+        lv = self.query_one(lv_id, ListView)
+        item = lv.highlighted_child
+        if info_id := ("#search-info" if active == "search"
+                      else "#queue-info"):
+            info = self.query_one(info_id, Label)
+        else:
+            info = None
+        if not isinstance(item, TrackItem):
+            # ListView highlights nothing until the cursor moves — fall back
+            # to the first item so Shift+Q works immediately after focusing.
+            if lv.children:
+                lv.index = 0
+                item = lv.highlighted_child
+        if not isinstance(item, TrackItem):
+            if info:
+                info.update("nothing here to queue — Shift+Q queues from "
+                            "Search or Library lists")
+            return
+        self._call("queue", {"action": "add", "ref": str(item.track["id"])})
+        if info:
+            info.update(
+                f"queued: {item.track.get('title')!r} — "
+                + ("Enter plays; Shift+Q queues" if active == "search"
+                   else "Enter removes; g generates a similar queue"))
+        self.refresh_queue()
+
+    def action_toggle_panel(self) -> None:
+        """Toggle fullscreen lyrics panel."""
+        self._panel_visible = not self._panel_visible
+        if self._panel_visible:
+            self._show_panel()
+        else:
+            self._hide_panel()
+
+    def _show_panel(self) -> None:
+        panel = self.query_one("#fullscreen-panel")
+        panel.display = True
+        self.query_one("#fs-lyrics", RichLog).border_title = " lyrics "
+        self._refresh_panel()
+        self.query_one("#fs-lyrics").focus()
+
+    def _hide_panel(self) -> None:
+        panel = self.query_one("#fullscreen-panel")
+        panel.display = False
+        self.call_after_refresh(lambda: self.query_one("#tabs").focus())
+
+    def _refresh_panel(self) -> None:
+        self.query_one("#fs-title-text").update(self._get_now_playing())
+        self.query_one("#fs-status-text").update(self._get_status_line())
+        try:
+            lyrics = self._call("lyrics").get("lyrics")
+        except Exception:
+            lyrics = None
+        log = self.query_one("#fs-lyrics", RichLog)
+        log.clear()
+        log.write(lyrics or "(no lyrics)")
+
+    @staticmethod
+    def _artist_title_line(artist: str, title: str) -> str:
+        """Rendered now-playing line; many local filenames already embed the
+        artist ("Artist - Title"), so avoid printing it twice."""
+        if artist and not title.lower().startswith(artist.lower()):
+            return f"{artist} — {title}"
+        return title
+
+    def _get_now_playing(self) -> str:
+        st = self._call("status")
+        return self._artist_title_line(st.get("artist") or "",
+                                       st.get("title") or "idle")
+
+    def _get_status_line(self) -> str:
+        st = self._call("status")
+        vol = st.get("volume", "")
+        am = self._call("automix", {"action": "config"}).get("enabled", False)
+        state = st.get("state", "idle")
+        am_text = "ON" if am else "OFF"
+        return "Vol %s%%  AutoMix %s   %s" % (vol, am_text, state)
+
     def action_lyrics(self) -> None:
         r = self._call("lyrics")
         text = r.get("lyrics") or "(no lyrics)"
@@ -304,7 +485,7 @@ class MuseTUI(App):
         lv.clear()
         results = r.get("results", [])
         self.query_one("#search-info", Label).update(
-            f"{len(results)} result(s) for {q!r} — Enter plays; Q queues")
+            f"{len(results)} result(s) for {q!r} — Enter plays; Shift+Q queues")
         for i, t in enumerate(results, 1):
             lv.append(TrackItem(t, prefix=f"{i}. "))
         self._last_search = q
@@ -415,22 +596,23 @@ class MuseTUI(App):
     # -- refreshers ----------
     def refresh_status(self) -> None:
         st = self._call("status")
+        state = st.get("state") or "idle"
+        icon = {"playing": "▶", "paused": "‖", "stopped": "■"}.get(state, "•")
         title = st.get("title") or "idle"
         artist = st.get("artist") or ""
         self.query_one("#np-title", Label).update(
-            f"▶ {artist} — {title}" if artist else f"▶ {title}")
-        am = self._call("automix", {"action": "config"})
+            f"{icon} {self._artist_title_line(artist, title)}")
+        am_on = self._call("automix", {"action": "config"}).get("enabled")
         self.query_one("#np-status", Label).update(
-            f"Vol {st.get('volume', '?')}%  ·  AutoMix {'ON' if am.get('enabled') else 'OFF'}"
-            f"  ·  state {st.get('state')}")
-        self.sub_title = f"{st.get('state', 'idle')}"
+            f"Vol {st.get('volume', '?')}%  ·  AutoMix {'ON' if am_on else 'OFF'}"
+            f"  ·  {state}")
+        self.sub_title = state
         self.refresh_cover(st)
 
     def refresh_cover(self, st: dict) -> None:
         """Now-playing album art (kitty TGP image only, no-op elsewhere)."""
         tid = st.get("id")
-        if tid == getattr(self, "_cover_track_id", object()) and not (
-                self._cover_failed):
+        if tid == self._cover_track_id and not self._cover_failed:
             return
         self._cover_track_id = tid
         self._cover_failed = False
@@ -455,8 +637,11 @@ class MuseTUI(App):
         pos, dur = st.get("position") or 0, st.get("duration") or 0
         width = 40
         frac = min(1.0, (pos / dur)) if dur else 0
-        filled = int(frac * width)
-        bar = "▏" + "█" * filled + "·" * (width - filled) + "▕"
+        filled = frac * width
+        full = int(filled)
+        half = 1 if filled - full >= 0.5 else 0
+        bar = "▏" + "█" * full + ("▌" if half else "") \
+            + "░" * (width - full - half) + "▕"
         self.query_one("#progress", Label).update(
             f"{bar}  {_fmt(pos)} / {_fmt(dur)}")
 
@@ -468,7 +653,7 @@ class MuseTUI(App):
             lv.append(TrackItem(q, prefix=f"{q.get('position')}. "))
         info = self.query_one("#queue-info", Label)
         info.update(f"{len(r.get('queue', []))} queued — Enter removes; "
-                    "G generates a similar queue")
+                    "g generates a similar queue")
 
     def refresh_library(self) -> None:
         r = self._call("library", {"limit": 500})

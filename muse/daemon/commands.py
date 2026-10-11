@@ -131,8 +131,11 @@ class MuseCommands:
         return {"state": "stopped"}
 
     def cmd_next(self, smart: bool | None = None) -> dict:
-        """Play next: live crossfade when AutoMix is on, else hard switch;
-        Smart Shuffle pick when the queue is empty."""
+        """Play next: SKIP the current track — the new voice is `current`
+        immediately with a short crossfade (the outgoing voice falls away as
+        an engine tail), so status moves on the very next refresh. Full
+        planned AutoMix overlaps still happen on their own at natural track
+        ends via the service tick. Smart Shuffle pick when the queue is empty."""
         db = self.db()
         eng = self.audio_engine()
         smart = db.get_setting_bool("shuffle_smart", True) if smart is None else smart
@@ -144,37 +147,27 @@ class MuseCommands:
                 nxt_id = pick["id"]
         if not nxt_id:
             return {"state": "queue empty"}
-        if eng.current and not eng.current.done and \
-                db.get_setting_bool("automix_enabled", True):
-            plan = self._plan_to_track(eng.current.track_id, nxt_id)
-            overlap = db.get_setting_float("automix_transition_length", 8.0)
-            if plan and plan.get("score", 0) >= 45:
-                out = self._live_crossfade(nxt_id, plan["overlap_sec"],
-                                           tempo=plan["tempo_scale"],
-                                           band=db.get_setting_bool("automix_bandpass", True),
-                                           seek=plan.get("b_start_sec") or 0.0)
-                out["plan_score"] = plan.get("score")
-                return out
-            remaining = (eng.current.duration or 0) - eng.position()
-            if remaining > 1.0:
-                out = self._live_crossfade(nxt_id, min(overlap, remaining))
-                return out
-        return self.cmd_play(track_id=nxt_id)
+        return self._skip_to(nxt_id)
 
-    def _live_crossfade(self, nxt_id: int, fade_seconds: float, tempo: float = 1.0,
-                        band: bool = False, seek: float = 0.0) -> dict:
+    def _skip_to(self, nxt_id: int, fade_seconds: float = 0.8) -> dict:
+        """Hard-skip wiring: install `nxt_id` as the current voice right now
+        (engine.skip_to tails the outgoing one). No automix planning on a
+        skip — no blocking analysis, no overlap-only tempo — and a track
+        that fails to decode leaves the current playback untouched."""
         db = self.db()
         nxt = db.get_track(nxt_id)
-        if not nxt:
-            return {"error": f"no track {nxt_id}"}
-        voice = self._make_voice(db, nxt, tempo_scale=tempo, seek=seek)
+        if not nxt or not nxt.get("file_path"):
+            return {"error": f"no playable track {nxt_id}"}
+        voice = self._make_voice(db, nxt)
+        if voice.decoder.failed:
+            voice.decoder.close()
+            return {"error": f"could not decode {nxt['title']!r}"}
         eng = self.audio_engine()
-        eng.begin_crossfade(voice, fade_seconds, band_limited=band)
+        eng.skip_to(voice, fade_seconds=fade_seconds)
         eng.resume()
         db.record_play(nxt_id, 0)
         self._media_now_playing(nxt)
-        return {"playing": nxt["title"], "duration": nxt.get("duration"),
-                "crossfade": round(float(fade_seconds), 2)}
+        return {"playing": nxt["title"], "duration": nxt.get("duration")}
 
     def cmd_prev(self) -> dict:
         """Real previous: restart the current track; before 3s, return to the
@@ -822,14 +815,6 @@ class MuseCommands:
             db.conn.commit()
             return {"cover": path, "cached": False}
         return {"cover": "", "cached": False}
-
-    # helper -----------------------------------------------------------------------
-    def _probe_duration(self, path: str) -> float:
-        try:
-            from muse.analysis.decoder import ffprobe_duration
-            return ffprobe_duration(path)
-        except Exception:
-            return 0.0
 
     # -- daemon tick: auto-advance + live AutoMix ---------------------------------
     def service_tick(self) -> dict | None:

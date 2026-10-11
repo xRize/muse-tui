@@ -59,14 +59,25 @@ class BandFilter:
         return lp32 if self.kind == "lowpass" else (block - lp32)
 
 
+def _fade_finished(v: "Voice") -> bool:
+    """True once a fading voice has nothing more to contribute."""
+    if v.done or v.failed:
+        return True
+    if v.fade_start is not None and \
+            (v.samples_played - v.fade_start) >= v.fade_samples:
+        return True
+    # a skip tail whose fade already ran out: Voice.fill clears fade_start
+    # once the fade completes, so infer completion from the tail flag
+    return v.skip_tail and v.fade_start is None
+
+
 class DecodeProcess:
     """Long-running `ffmpeg` process decoding one file to f32le stereo PCM."""
 
-    def __init__(self, path: str, sr: int = SR, gain: float = 0.0,
+    def __init__(self, path: str, sr: int = SR,
                  tempo: float = 1.0, seek: float = 0.0,
                  prebuffer: float = 0.5):
         self.path = path
-        self.gain = gain  # linear scalar
         self.tempo = tempo
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
         cmd = [ffmpeg, "-v", "error", "-nostdin"]
@@ -81,7 +92,6 @@ class DecodeProcess:
             stdin=subprocess.DEVNULL,
         )
         self.samples_returned = 0   # content samples handed out (pre/pipe)
-        self.gain = gain  # linear scalar
         # Prime the pipe so the first callback read never blocks on a cold
         # ffmpeg (spawn + header + filter init ≈ hundreds of ms -> underruns).
         if prebuffer > 0:
@@ -145,7 +155,7 @@ class Voice:
         self.duration = duration
         self.seek = seek
         self.tempo = tempo
-        self.decoder = DecodeProcess(path, SR, gain, tempo, seek)
+        self.decoder = DecodeProcess(path, SR, tempo, seek)
         self.gain = gain  # linear scalar applied in fill()
         self.samples_played = 0
         self.samples_decoded = 0
@@ -156,19 +166,18 @@ class Voice:
         self.filter = band_filter
         self.done = False
         self.failed = False
+        self.skip_tail = False   # engine tail: fading out after an explicit skip
         self.lock = threading.Lock()
-        self._eof = False
 
     # -- timeline ------------------------------------------------------------
     @property
     def position_seconds(self) -> float:
         return self.seek + self.samples_played / SR
 
-    def remaining_samples(self) -> int:
-        return max(0, int((self.duration - self.position_seconds) * SR))
-
     def start_fade(self, fade_seconds: float, to_level: float) -> None:
         """Fade `level -> to_level` over fade_seconds of played samples."""
+        if self.fade_start is not None:
+            self.level = self._current_level()  # mid-fade: keep the live level
         self.fade_start = self.samples_played
         self.fade_samples = max(1, int(fade_seconds * SR))
         self.fade_to = to_level
@@ -197,7 +206,6 @@ class Voice:
         while total < n:
             got = self.decoder.read(n - total)
             if got.shape[0] == 0:
-                self._eof = True
                 break
             with self.lock:
                 self.samples_decoded += got.shape[0]
@@ -247,6 +255,11 @@ class Engine:
         # (cur, nxt) parked by handoff_if_ready; finish_pending_handoff() does
         # the expensive decoder work — never inside the audio callback.
         self.pending_handoff: tuple[Voice, Voice] | None = None
+        # tails are skipped-away voices still fading out; once their fade is
+        # done they are parked in pending_closes and their decoder is closed
+        # off the audio callback (see _park_finished_tails/_drain_close_queue)
+        self.tails: list[Voice] = []
+        self.pending_closes: list[Voice] = []
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -266,7 +279,11 @@ class Engine:
 
     def stop(self) -> None:
         self._stop = True
-        for v in (self.current, self.upcoming):
+        with self._lock:
+            parked = self.tails + self.pending_closes
+            self.tails.clear()
+            self.pending_closes.clear()
+        for v in (self.current, self.upcoming, *parked):
             if v:
                 v.decoder.close()
         if self.stream:
@@ -284,13 +301,6 @@ class Engine:
                 self.current.decoder.close()
             self.current = voice
             self.upcoming = None
-
-    def queue_voice(self, voice: Voice | None) -> None:
-        """Set the prebuffered next voice (does not start mixing yet)."""
-        with self._lock:
-            if self.upcoming and self.upcoming is not voice:
-                self.upcoming.decoder.close()
-            self.upcoming = voice
 
     def position(self) -> float:
         v = self.current
@@ -322,18 +332,33 @@ class Engine:
             incoming.start_fade(fade_seconds, 1.0)
             return True
 
-    def promote_upcoming(self) -> None:
-        """Stop routing the incoming crossfade voice; its post-overlap tail
-        plays unmangled once promoted (filter removed). The overlap-only
-        tempo scale is NOT reset here — the running decoder keeps its
-        `atempo` filter; handoff_if_ready rebuilds the decoder at tempo 1.0
-        when the outgoing track finishes."""
+    def skip_to(self, incoming: Voice, fade_seconds: float = 0.8) -> None:
+        """Explicit skip: `incoming` becomes `current` right away.
+
+        The outgoing voice keeps mixing while it fades out over
+        `fade_seconds` (a short crossfade instead of a hard cut), is parked
+        when its fade completes, and its decoder is closed off the callback
+        by `finish_pending_handoff()`. Any natural-automix `upcoming` voice
+        is parked too, so nothing stale keeps playing or leaks a decoder.
+        No band filter and no overlap-only tempo here: the incoming voice is
+        promoted immediately, so nothing later unmangles it.
+        """
         with self._lock:
-            nxt, self.upcoming = self.upcoming, None
-            if nxt:
-                nxt.end_fade(level=1.0)
-                nxt.filter = None
-                self.current = nxt
+            cur = self.current
+            self.current = incoming
+            if cur is not None:
+                if cur.failed:
+                    self.pending_closes.append(cur)  # never made sound
+                else:
+                    cur.skip_tail = True
+                    cur.start_fade(fade_seconds, 0.0)
+                    self.tails.append(cur)
+            nxt = self.upcoming
+            if nxt is not None and nxt is not incoming:
+                self.pending_closes.append(nxt)      # cut it mid fade-in
+            self.upcoming = None
+            incoming.level = 0.0  # fade-in must start from silence
+            incoming.start_fade(fade_seconds, 1.0)
 
     def handoff_if_ready(self) -> bool:
         """When the outgoing track finished, swap in the incoming voice.
@@ -367,29 +392,38 @@ class Engine:
         `position_seconds`, which double-counts the overlap once this voice
         is `current`. The voice's output counter restarts (samples_played=0,
         seek=phase) so position_seconds = phase + new-output/SR stays true
-        file-time at the new tempo 1.0. Called every service tick; a no-op
-        without a swap."""
+        file-time at the new tempo 1.0. Called every service tick; also
+        drains the parked voice close queue (see skip_to)."""
         job = self.pending_handoff
-        if not job:
-            return
-        cur, nxt = job
+        if job:
+            cur, nxt = job
+            with self._lock:
+                if self.current is not nxt:    # a new track took over meanwhile
+                    self.pending_handoff = None
+                else:
+                    phase = nxt.decoder.samples_returned / \
+                        (nxt.tempo if abs(nxt.tempo - 1.0) > 1e-6 else 1.0) / SR
+                    if abs(nxt.tempo - 1.0) > 1e-6:
+                        nxt.decoder.close()
+                        nxt.decoder = DecodeProcess(nxt.path, SR,
+                                                    tempo=1.0, seek=phase,
+                                                    prebuffer=0.5)
+                        nxt.tempo = 1.0
+                    nxt.samples_played = 0   # restart output clock at the new seek
+                    nxt.samples_decoded = 0
+                    nxt.seek = phase
+                    cur.decoder.close()
+                    self.pending_handoff = None
+        self._drain_close_queue()
+
+    def _drain_close_queue(self) -> None:
+        """Close decoders of parked voices (skipped tails / orphaned
+        upcoming voices) — off the audio callback, on a service tick."""
         with self._lock:
-            if self.current is not nxt:    # a new track took over meanwhile
-                self.pending_handoff = None
-                return
-            phase = nxt.decoder.samples_returned / \
-                (nxt.tempo if abs(nxt.tempo - 1.0) > 1e-6 else 1.0) / SR
-            if abs(nxt.tempo - 1.0) > 1e-6:
-                nxt.decoder.close()
-                nxt.decoder = DecodeProcess(nxt.path, SR, nxt.gain,
-                                            tempo=1.0, seek=phase,
-                                            prebuffer=0.5)
-                nxt.tempo = 1.0
-            nxt.samples_played = 0   # restart output clock at the new seek
-            nxt.samples_decoded = 0
-            nxt.seek = phase
-            cur.decoder.close()
-            self.pending_handoff = None
+            closing = self.pending_closes
+            self.pending_closes = []
+        for v in closing:
+            v.decoder.close()
 
     # -- seek ---------------------------------------------------------------------
     def seek(self, seconds: float) -> float:
@@ -408,9 +442,7 @@ class Engine:
             v.fade_start = None
             v.level = 1.0
             v.decoder.close()
-            v.decoder = DecodeProcess(v.path, SR, v.decoder.gain,
-                                      v.tempo, s)
-            v._eof = False
+            v.decoder = DecodeProcess(v.path, SR, v.tempo, s)
             return s
 
     # -- auto-advance service (called every ~0.5s by the daemon) ------------------
@@ -435,16 +467,34 @@ class Engine:
         self._started.set()
         out = outdata.reshape(frames, CHANNELS)
         with self._lock:
+            mixed = False
             cur, nxt = self.current, self.upcoming
             if cur:
                 if not cur.done:
                     cur.fill(out, frames)
+                    mixed = True
                 if nxt:
                     nxt.fill(out, frames)   # keep mixing even cur is done —
                     # zero dead-air gap between cur's eof and the swap
-                out *= self.master
+                    mixed = True
                 if cur.done and nxt:        # state swap only — no decoder work
                     self.handoff_if_ready()
+            if self.tails:                  # explicit-skip voices fading out
+                for tail in self.tails:
+                    if not tail.done:
+                        tail.fill(out, frames)
+                        mixed = True
+                self._park_finished_tails()
+            if mixed:
+                out *= self.master
+
+    def _park_finished_tails(self) -> None:
+        """Park tails whose fade completed (callback-side: no decoder work);
+        `finish_pending_handoff()` closes their decoders on a service tick."""
+        finished = [t for t in self.tails if _fade_finished(t)]
+        if finished:
+            self.pending_closes.extend(finished)
+            self.tails = [t for t in self.tails if t not in finished]
 
     # -- controls -----------------------------------------------------------------
     def set_volume(self, v: float) -> None:
@@ -458,6 +508,3 @@ class Engine:
 
     def resume(self) -> None:
         self.paused = False
-
-    def wait_started(self, timeout: float = 2.0) -> bool:
-        return self._started.wait(timeout)

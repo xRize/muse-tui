@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from muse import __version__
 from muse.daemon import ipc
@@ -532,14 +533,26 @@ def _daemon(action: str, as_json: bool) -> int:
             print("daemon already running")
             return 0
         import subprocess as _sp
+        import muse as _muse_pkg
+        # `python -m` puts the CWD first on sys.path, while the editable
+        # install is a meta-path finder — so a directory that merely CONTAINS
+        # a `muse/` folder (e.g. the repo root under ~) shadows the real
+        # package as a namespace module and every daemon request dies on
+        # `from muse import __version__`. Launch from the package's parent.
+        pkg_root = Path(_muse_pkg.__file__).resolve().parent.parent
         env = dict(os.environ)
-        log_file = os.path.join(str(__import__("pathlib").Path.home()), ".cache/muse/daemon.log")
+        log_file = os.path.join(str(Path.home()), ".cache/muse/daemon.log")
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         with open(log_file, "ab") as lf:
             proc = _sp.Popen(
                 [sys.executable, "-m", "muse.daemon.main"],
-                env=env, stdout=lf, stderr=lf, start_new_session=True)
-        time.sleep(1.0)
+                env=env, cwd=pkg_root, stdout=lf, stderr=lf,
+                start_new_session=True)
+        # the socket only appears after engine+DB startup; poll instead of the
+        # old fixed 1-second sleep, which declared failure on a healthy boot
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not ipc.daemon_running():
+            time.sleep(0.25)
         if ipc.daemon_running():
             print(f"daemon started (pid {proc.pid}, log {log_file})")
             return 0
